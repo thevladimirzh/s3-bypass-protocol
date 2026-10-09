@@ -1,4 +1,10 @@
+# Upstream's template pointed at XTLS/Xray-core discussions, which is the wrong
+# place for this fork: the fedarisha engine is developed here, and the trackers
+# this fork inherits are read-only upstream.
 contact_links:
-  - name: Community Support and Questions
-    url: https://github.com/XTLS/Xray-core/discussions
-    about: Please ask and answer questions there. The issue tracker is for issues with core.
+  - name: S3 Bypass Desktop
+    url: https://github.com/thevladimirzh/s3-bypass-desktop
+    about: Desktop client for this engine — report client-side problems there.
+  - name: Upstream engine
+    url: https://github.com/Fedarisha/Xray-core-fedarisha
+    about: The fork this one is based on, for issues outside the fedarisha changes.
