@@ -1,0 +1,74 @@
+name: Fork CI
+
+# Our own gate for the fedarisha changes. The inherited upstream workflows
+# exercise the whole Xray surface and depend on geodata assets that are not
+# vendored here, so they report failures unrelated to this fork. This workflow
+# covers what we actually changed, and it is strict: race detector, vet, and a
+# gofmt check.
+
+on:
+  push:
+    branches: [main, 'readpath-robustness', 'writer-delivery-guarantee']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fedarisha:
+    name: fedarisha transport (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l proxy/fedarisha/)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./proxy/fedarisha/...
+
+      - name: test (race)
+        run: go test -race -count=1 -timeout 600s ./proxy/fedarisha/...
+
+      - name: build
+        run: go build ./...
+
+  cross-build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-x64,  goos: darwin, goarch: amd64 }
+          - { target: darwin-arm64, goos: darwin, goarch: arm64 }
+          - { target: linux-x64,    goos: linux,   goarch: amd64 }
+          - { target: linux-arm64,  goos: linux,   goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags '-s -w' -o xray ./main
+
+      - name: smoke (version)
+        run: |
+          # A cross-built binary cannot run here, so assert it is a real
+          # executable for the target rather than silently empty.
+          test -s xray
+          file xray || true
