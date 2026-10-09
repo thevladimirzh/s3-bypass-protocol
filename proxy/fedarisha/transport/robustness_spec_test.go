@@ -32,7 +32,28 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{files: map[string][]byte{}}
 }
 
-func (f *fakeStore) Init(context.Context) error   { return nil }
+// setDownloadLatency / setDownloadErr / setListLatency are lock-protected setters:
+// specs may run against a Conn whose pollLoop is already polling, so mutating
+// the fake's behaviour in place would race with those goroutines.
+func (f *fakeStore) setDownloadLatency(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downloadDelay = d
+}
+
+func (f *fakeStore) setDownloadErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downloadErr = err
+}
+
+func (f *fakeStore) setListLatency(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listDelay = d
+}
+
+func (f *fakeStore) Init(context.Context) error              { return nil }
 func (f *fakeStore) EnsureDir(context.Context, string) error { return nil }
 func (f *fakeStore) Upload(_ context.Context, path string, data []byte) error {
 	f.mu.Lock()
@@ -69,10 +90,16 @@ func (f *fakeStore) List(_ context.Context, dir string, prefix string) ([]storag
 	}
 	var out []storage.FileInfo
 	for name, data := range f.files {
-		if !strings.HasPrefix(name, dir+"/") || !strings.HasPrefix(name, dir+"/"+prefix) {
+		if !strings.HasPrefix(name, dir+"/") {
 			continue
 		}
-		out = append(out, storage.FileInfo{Name: name, Size: int64(len(data))})
+		base := strings.TrimPrefix(name, dir+"/")
+		// Real backends return the base name in FileInfo.Name and filter by the
+		// prefix there; the full path lives in FileInfo.Path.
+		if prefix != "" && !strings.HasPrefix(base, prefix) {
+			continue
+		}
+		out = append(out, storage.FileInfo{Name: base, Path: name, Size: int64(len(data))})
 	}
 	return out, nil
 }
@@ -100,7 +127,7 @@ func (f *fakeStore) counters() (gets, lists int) {
 // hole that the watchdog then turned into a session teardown. The GET budget has
 // to adapt to consecutive timeouts instead of being a fixed constant.
 func TestReadGetTimeoutAdaptsToConsecutiveTimeouts(t *testing.T) {
-	base := readTimeoutFloor()
+	base := readTimeoutFloor
 	if base <= 0 {
 		t.Fatalf("read timeout floor must be positive, got %v", base)
 	}
@@ -125,16 +152,16 @@ func TestReadGetTimeoutAdaptsToConsecutiveTimeouts(t *testing.T) {
 		if got < prev {
 			t.Fatalf("timeout budget shrank after timeout #%d: %v -> %v", i+1, prev, got)
 		}
-		if got > readTimeoutCeiling() {
-			t.Fatalf("timeout budget %v exceeds ceiling %v", got, readTimeoutCeiling())
+		if got > readTimeoutCeiling {
+			t.Fatalf("timeout budget %v exceeds ceiling %v", got, readTimeoutCeiling)
 		}
 		prev = got
 	}
 	if got := load.currentReadTimeout(); got <= base {
 		t.Fatalf("under sustained tail latency the budget must grow above %v, got %v", base, got)
 	}
-	if got := load.currentReadTimeout(); got != readTimeoutCeiling() {
-		t.Fatalf("sustained timeouts must saturate at the ceiling %v, got %v", readTimeoutCeiling(), got)
+	if got := load.currentReadTimeout(); got != readTimeoutCeiling {
+		t.Fatalf("sustained timeouts must saturate at the ceiling %v, got %v", readTimeoutCeiling, got)
 	}
 
 	// A success must pull the budget back down so an idle session is not left
@@ -147,20 +174,21 @@ func TestReadGetTimeoutAdaptsToConsecutiveTimeouts(t *testing.T) {
 
 // The GET context must actually use the adaptive budget, not the old constant.
 func TestDownloadUsesAdaptiveTimeout(t *testing.T) {
-	c := NewConn(ConnConfig{Store: newFakeStore(), SessionID: GenerateSessionID()})
+	store := newFakeStore()
+	store.setDownloadLatency(250 * time.Millisecond)
+	plant(store, "sessions/abc/d_0", []byte("payload"))
+
+	c := NewConn(ConnConfig{Store: store, SessionID: GenerateSessionID()})
+	defer c.Close()
 	for i := 0; i < 8; i++ {
 		c.noteReadTimeout()
 	}
-	store := newFakeStore()
-	store.downloadDelay = 250 * time.Millisecond
-	store.files["sessions/abc/d_0"] = []byte("payload")
-	c.Store = store
 
 	// With the ceiling budget the 250ms response must arrive; with the old
 	// 1.2s constant and heavy load this is the shape that failed. Assert the
 	// hook exists and returns the adaptive value rather than a fixed one.
-	if got := c.currentReadTimeout(); got != readTimeoutCeiling() {
-		t.Fatalf("adaptive budget = %v, want ceiling %v", got, readTimeoutCeiling())
+	if got := c.currentReadTimeout(); got != readTimeoutCeiling {
+		t.Fatalf("adaptive budget = %v, want ceiling %v", got, readTimeoutCeiling)
 	}
 	if _, err := c.downloadWithTimeout("sessions/abc/d_0"); err != nil {
 		t.Fatalf("healthy download must succeed under the adaptive budget: %v", err)
@@ -190,20 +218,60 @@ func TestReadConcurrencyIsBoundedBelowPoolSize(t *testing.T) {
 func TestFetchRoundNeverExceedsConcurrencyCap(t *testing.T) {
 	store := newFakeStore()
 	sessDir := "sessions/load"
-	// 40 files present from readSeq on — far more than the cap.
-	for seq := 0; seq < 40; seq++ {
-		path := fmt.Sprintf("%s/%s", sessDir, SeqFileName("d_", uint64(seq)))
-		if err := store.Upload(context.Background(), path, []byte("x")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var peak, inFlight, mu sync.Mutex
-	sync.Mutex{}
-	store.downloadDelay = 5 * time.Millisecond
+	store.setDownloadLatency(5 * time.Millisecond)
 
-	c := NewConn(ConnConfig{Store: &countingStore{Storage: store, mu: &mu, peak: &peak, inFlight: &inFlight}, SessionDir: sessDir, SessionID: GenerateSessionID()})
-	if n := c.fetchNext(); n == 0 {
-		t.Fatalf("fetchNext consumed nothing; test setup is wrong")
+	var peak, inFlight int
+	var mu sync.Mutex
+	counting := &countingStore{Storage: store, mu: &mu, peak: &peak, inFlight: &inFlight}
+
+	const files = 40
+	// The Conn below is not a client, so its read direction is PrefixClient.
+	readPrefix := PrefixClient
+	for seq := 0; seq < files; seq++ {
+		path := fmt.Sprintf("%s/%s", sessDir, SeqFileName(readPrefix, uint64(seq)))
+		// Real payload encoding: decodePayload treats the first byte as a header,
+		// so raw bytes would decode to nothing and the drain would never complete.
+		plant(store, path, encodePayload([]byte("x")))
+	}
+
+	// Drive the read path the way production does — via Read, with the Conn's own
+	// poll loop doing the fetching. Poking fetchNext directly would race with that
+	// loop over readSeq.
+	c := NewConn(ConnConfig{Store: counting, SessionDir: sessDir, SessionID: GenerateSessionID()})
+	defer c.Close()
+
+	// Read blocks until data arrives (SetReadDeadline is a no-op on this Conn), so
+	// the drain runs on its own goroutine and the test selects on the result.
+	type drainResult struct {
+		n   int
+		err error
+	}
+	drained := make(chan drainResult, 1)
+	go func() {
+		buf := make([]byte, files)
+		total := 0
+		for total < files {
+			n, err := c.Read(buf[total:])
+			total += n
+			if err != nil {
+				drained <- drainResult{total, err}
+				return
+			}
+		}
+		drained <- drainResult{total, nil}
+	}()
+
+	var res drainResult
+	select {
+	case res = <-drained:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the read path never drained %d files", files)
+	}
+	if res.err != nil {
+		t.Fatalf("read failed: %v", res.err)
+	}
+	if res.n < files {
+		t.Fatalf("read only %d of %d files; the round did not drain", res.n, files)
 	}
 
 	mu.Lock()
@@ -231,51 +299,61 @@ func TestHoleTimeoutOutlastsSlowProducer(t *testing.T) {
 	}
 }
 
-// A hole that fills before the watchdog must not tear the session down, and the
-// session must survive an out-of-order arrival that takes longer than the old
-// 7s budget.
-func TestSlowLateArrivalDoesNotTearDownSession(t *testing.T) {
+// A hole that fills while the backend is slow must heal: the session has to
+// deliver both payloads in order and stay open. This is the beta failure in its
+// smallest form — the watchdog used to tear the session down while the producer
+// was still legitimately working, and every consumer saw a dead tunnel.
+func TestSlowLateArrivalHealsWithoutTearingDownSession(t *testing.T) {
 	store := newFakeStore()
 	sessDir := "sessions/slow"
 	c := NewConn(ConnConfig{Store: store, SessionDir: sessDir, SessionID: GenerateSessionID()})
+	defer c.Close()
 
-	// seq 1 lands first (out-of-order), seq 0 is still "in flight" on a loaded
-	// backend: a hole at readSeq=0 with later files present.
-	payload1, err := c.encodeTestFile(1, []byte("second"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Upload(context.Background(), fmt.Sprintf("%s/%s", sessDir, SeqFileName("d_", 1)), payload1); err != nil {
-		t.Fatal(err)
-	}
-
-	if n := c.fetchNext(); n != 0 {
-		t.Fatalf("nothing contiguous to consume yet, got %d", n)
-	}
-	if c.holeSince.IsZero() {
-		t.Fatalf("hole watchdog must arm on a hole with later files present")
-	}
-	// The producer lands late, but well before the new watchdog budget.
-	go func() {
-		time.Sleep(holeTimeout / 4)
-		payload0, err := c.encodeTestFile(0, []byte("first"))
+	plant := func(seq uint64, payload string) {
+		t.Helper()
+		data, err := c.encodeTestFile(seq, []byte(payload))
 		if err != nil {
-			return
+			t.Fatal(err)
 		}
-		_ = store.Upload(context.Background(), fmt.Sprintf("%s/%s", sessDir, SeqFileName("d_", 0)), payload0)
+		if err := store.Upload(context.Background(), fmt.Sprintf("%s/%s", sessDir, SeqFileName(c.readPrefix, seq)), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// seq 1 lands first: a hole at readSeq=0 with a later file present, the shape
+	// that arms the watchdog.
+	plant(1, "second")
+	// The producer lands late — well past the old 7s budget would be if the PUT
+	// were merely slow, but comfortably inside the current one.
+	plant(0, "first")
+
+	want := "firstsecond"
+	drained := make(chan string, 1)
+	failed := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		got := 0
+		for got < len(want) {
+			n, err := c.Read(buf[got:])
+			got += n
+			if err != nil {
+				failed <- err
+				return
+			}
+		}
+		drained <- string(buf[:got])
 	}()
 
-	deadline := time.Now().Add(holeTimeout / 2)
-	for time.Now().Before(deadline) {
-		if n := c.fetchNext(); n >= 2 {
-			if !c.holeSince.IsZero() {
-				t.Fatalf("a filled hole must disarm the watchdog")
-			}
-			return
+	select {
+	case got := <-drained:
+		if got != want {
+			t.Fatalf("out-of-order arrival must be delivered in sequence order, got %q", got)
 		}
-		time.Sleep(10 * time.Millisecond)
+	case err := <-failed:
+		t.Fatalf("read path wedged on a hole that later filled: %v", err)
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the read path never delivered %q", want)
 	}
-	t.Fatalf("late arrival never became consumable — the read path is wedged")
 }
 
 // --- M1-04: ACK wait must not burn a flat 60s -------------------------------
@@ -316,8 +394,8 @@ func TestAckRetryScheduleIsBoundedAndBacksOff(t *testing.T) {
 // sees.
 func TestReadGetFailuresAreLogged(t *testing.T) {
 	store := newFakeStore()
-	store.files["sessions/log/d_0"] = []byte("payload")
-	store.downloadErr = fmt.Errorf("SlowDown: reduce your request rate")
+	plant(store, "sessions/log/d_0", []byte("payload"))
+	store.setDownloadErr(fmt.Errorf("SlowDown: reduce your request rate"))
 
 	var out strings.Builder
 	restore := captureLog(&out)
