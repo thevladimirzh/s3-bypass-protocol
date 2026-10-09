@@ -11,6 +11,37 @@ import (
 
 const x25519KeySize = 32
 
+// uploadRetrying keeps PUTting a small control file until the backend takes it
+// or ctx ends, with the same pacing the data path uses. The handshake used to
+// write the hello file exactly once: a single rejected request during the
+// handshake killed the whole dial, even though the identical failure moments
+// later on a data file is now retried indefinitely (uploadUntilDelivered).
+func uploadRetrying(ctx context.Context, store storage.Storage, path string, data []byte, tag string) error {
+	delay := uploadRetryMinDelay
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		lastErr = store.Upload(ctx, path, data)
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return lastErr
+		}
+		log.Printf("[fedarisha-client] %s upload retry %d for %s: %v; retrying in %v", tag, attempt, path, lastErr, delay)
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(delay):
+		}
+		if delay < uploadRetryMaxDelay {
+			delay *= 2
+			if delay > uploadRetryMaxDelay {
+				delay = uploadRetryMaxDelay
+			}
+		}
+	}
+}
+
 // ackRetrySchedule is how long to wait for the server's ACK in each successive
 // attempt: short first, growing later, so the common case (a peer that answers
 // within a second or two) is fast, the slow case still gets patience, and the
@@ -86,7 +117,7 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 	copy(helloData[len(sessID):], pubKey)
 
 	helloPath := sessDir + "/" + HelloFile
-	if err := d.Store.Upload(ctx, helloPath, helloData); err != nil {
+	if err := uploadRetrying(ctx, d.Store, helloPath, helloData, "hello"); err != nil {
 		return nil, fmt.Errorf("fedarisha dial: write hello: %w", err)
 	}
 

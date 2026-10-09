@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/proxy/fedarisha/storage"
 )
 
 // errPutFlaky is the failure a backend returns under load. The live incident
@@ -18,16 +20,18 @@ var errPutFlaky = errors.New("put failed: backend unavailable")
 // flakyStore fails the first `failFirst` Upload attempts of every path, then
 // accepts. It models a saturated S3 that drops a few requests — the condition
 // that produced the permanently missing read-direction object in the field
-// (hole at seq 12 with 120 later files present).
+// (hole at seq 12 with 120 later files present). Any storage.Storage can be
+// wrapped, so the same fault can be injected over the fake store or over the
+// real local-filesystem backend the end-to-end stand uses.
 type flakyStore struct {
-	*fakeStore
+	storage.Storage
 	mu        sync.Mutex
 	failFirst int
 	attempts  map[string]int
 }
 
 func newFlakyStore(failFirst int) *flakyStore {
-	return &flakyStore{fakeStore: newFakeStore(), failFirst: failFirst, attempts: map[string]int{}}
+	return &flakyStore{Storage: newFakeStore(), failFirst: failFirst, attempts: map[string]int{}}
 }
 
 func (f *flakyStore) Upload(ctx context.Context, path string, data []byte) error {
@@ -38,7 +42,7 @@ func (f *flakyStore) Upload(ctx context.Context, path string, data []byte) error
 	if n < f.failFirst {
 		return errPutFlaky
 	}
-	return f.fakeStore.Upload(ctx, path, data)
+	return f.Storage.Upload(ctx, path, data)
 }
 
 func (f *flakyStore) attemptCount(path string) int {
