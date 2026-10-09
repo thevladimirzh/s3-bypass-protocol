@@ -245,22 +245,32 @@ jobs:
 
       - name: Add additional assets into package
         run: |
-          mv -f resources/geo* build_assets/
-          if [[ ${GOOS} == 'windows' ]]; then
-            cp .github/build/windows/* build_assets/
+          # geo*.dat / geosite.dat and wintun.dll are downloaded at runtime by the
+          # geo and tun features. A fork may not have them (the asset-update
+          # workflow it would fetch them with needs permissions a fork lacks), and
+          # the fedarisha engine neither embeds nor needs them — so package what
+          # is present instead of failing the release over an absent blob.
+          shopt -s nullglob
+          geo=(resources/geo*)
+          if [[ ${#geo[@]} -gt 0 ]]; then
+            mv -f "${geo[@]}" build_assets/
+          else
+            echo "no geo assets present — skipping (runtime-downloaded upstream)"
           fi
           if [[ ${GOOS} == 'windows' ]]; then
+            cp .github/build/windows/* build_assets/
             echo 'Adding Wintun into packages'
-            if [[ ${GOARCH} == 'amd64' ]]; then
-              mv resources/wintun/bin/amd64/wintun.dll build_assets/
+            for pair in "amd64:amd64" "386:x86" "arm64:arm64"; do
+              src="resources/wintun/bin/${pair#*:}/wintun.dll"
+              if [[ -f "${src}" ]]; then
+                mv "${src}" build_assets/
+              else
+                echo "wintun for ${pair%%:*} not present — skipping"
+              fi
+            done
+            if [[ -f resources/wintun/LICENSE.txt ]]; then
+              mv resources/wintun/LICENSE.txt build_assets/LICENSE-Wintun
             fi
-            if [[ ${GOARCH} == '386' ]]; then
-              mv resources/wintun/bin/x86/wintun.dll build_assets/
-            fi
-            if [[ ${GOARCH} == 'arm64' ]]; then
-              mv resources/wintun/bin/arm64/wintun.dll build_assets/
-            fi
-            mv resources/wintun/LICENSE.txt build_assets/LICENSE-Wintun
           fi
 
       - name: Copy README.md & LICENSE
