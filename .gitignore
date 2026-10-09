@@ -36,6 +36,12 @@ vprotogen
 errorgen
 !common/errors/errorgen/
 *.dat
+# The geo databases are the exception: a fork cannot run the asset-update
+# workflow (its dispatch is refused), so they are vendored here to keep the
+# inherited geodata-dependent checks and builds working. Digests are recorded in
+# docs/analysis/geodata-assets.md and verified against the upstream sha256sums.
+!resources/geoip.dat
+!resources/geosite.dat
 
 # Build assets
 /build_assets/
