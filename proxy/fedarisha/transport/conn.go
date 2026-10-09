@@ -165,6 +165,12 @@ const (
 	uploadHedgeSizeCut = 256 * 1024 // bytes; files at/above use the large delay
 	uploadTimeout      = 8 * time.Second
 	uploadAttempts     = 3
+
+	// Retry pacing for uploadUntilDelivered. The retries above are hedged
+	// duplicates inside a single uploadWithTimeout call; these are the waits
+	// BETWEEN such calls when the file still has not landed.
+	uploadRetryMinDelay = 200 * time.Millisecond
+	uploadRetryMaxDelay = 5 * time.Second
 )
 
 // Read batching bounds. Each poll Lists the session dir (cheap, strongly
@@ -504,14 +510,60 @@ func (c *Conn) uploadWorker() {
 	defer c.uploadWg.Done()
 	for job := range c.uploadQueue {
 		t0 := time.Now()
-		err := c.uploadWithTimeout(job.path, job.data)
+		err := c.uploadUntilDelivered(job.path, job.data)
 		dt := time.Since(t0)
-		c.s3Puts.Add(1)
 		if err != nil {
 			c.s3PutErrors.Add(1)
 			log.Printf("[fedarisha:%s] upload ERR %s (%d B, %v): %v", c.sessionID[:8], job.path, len(job.data), dt, err)
 		} else {
 			log.Printf("[fedarisha:%s] upload %s (%d B, %v)", c.sessionID[:8], job.path, len(job.data), dt)
+		}
+	}
+}
+
+// uploadUntilDelivered PUTs a file and keeps retrying until the backend has
+// actually taken it, or the session goes away.
+//
+// A dropped file is unrecoverable, not merely late. The peer consumes strictly
+// in sequence, so if this writer loses file N the reader stalls at N for good
+// — later files pile up behind it and the session only recovers by being torn
+// down. That is the stall observed under load (2026-09/10): `hole at seq 12
+// ... (120 present)`, the writer having given up after uploadAttempts tries.
+// There is no in-protocol way for the reader to skip a missing object, so the
+// only correct writer behaviour is "deliver it or die trying".
+//
+// Retries are spaced (uploadRetryMinDelay doubling to uploadRetryMaxDelay) —
+// hammering a backend that is already saturated makes the outage worse — and
+// every retry is logged, because a silent retry is just a slower stall.
+func (c *Conn) uploadUntilDelivered(path string, data []byte) error {
+	delay := uploadRetryMinDelay
+	attempt := 0
+	for {
+		attempt++
+		c.s3Puts.Add(1)
+		start := time.Now()
+		err := c.uploadWithTimeout(path, data)
+		if err == nil {
+			return nil
+		}
+		if c.ctx.Err() != nil {
+			return err // session is closing — stop holding the object
+		}
+		log.Printf("[fedarisha:%s] upload retry %d for %s (%d B, attempt took %v): %v; retrying in %v",
+			c.sessionID[:8], attempt, path, len(data), time.Since(start).Round(time.Millisecond), err, delay)
+
+		select {
+		case <-c.closed:
+			return err
+		case <-c.ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		if delay < uploadRetryMaxDelay {
+			delay *= 2
+			if delay > uploadRetryMaxDelay {
+				delay = uploadRetryMaxDelay
+			}
 		}
 	}
 }
@@ -559,9 +611,14 @@ func (c *Conn) uploadWithTimeout(path string, data []byte) error {
 			if c.ctx.Err() != nil {
 				return err // session closing
 			}
-			if inflight == 0 { // all attempts failed — fire another if budget left
-				go put()
-				inflight++
+			if inflight == 0 {
+				// Every attempt this round failed. Hand the error back instead of
+				// re-firing immediately: an instant re-fire turns a failing backend
+				// into a hot loop (measured: over a million PUTs in 600ms against
+				// a store that was rejecting everything), which makes an overloaded
+				// backend worse. Spacing the retries is the caller's job —
+				// uploadUntilDelivered owns the backoff.
+				return err
 			}
 		case <-hedge.C:
 			if inflight < uploadAttempts {

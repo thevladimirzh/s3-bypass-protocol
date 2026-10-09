@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -160,27 +161,30 @@ func TestFlakyBackendStillDeliversEveryByteInOrder(t *testing.T) {
 	// More failures than uploadAttempts — upstream would drop the file here and
 	// wedge the reader forever.
 	store := newFlakyStore(5)
+	// Both ends of a fedarisha session share one directory in the bucket: each
+	// side writes its own prefix and reads the other's.
 	sessDir := "sessions/flaky"
 
-	writer := NewConn(ConnConfig{Store: store, SessionDir: sessDir + "/w", SessionID: GenerateSessionID()})
+	// The client writes PrefixClient and the server reads it, so the two ends are
+	// configured through the constructor rather than by mutating a prefix after
+	// the poll loop has already started reading it.
+	writer := NewConn(ConnConfig{Store: store, SessionDir: sessDir, SessionID: GenerateSessionID(), IsClient: true})
 	defer writer.Close()
-	reader := NewConn(ConnConfig{Store: store, SessionDir: sessDir + "/r", SessionID: GenerateSessionID()})
+	reader := NewConn(ConnConfig{Store: store, SessionDir: sessDir, SessionID: GenerateSessionID()})
 	defer reader.Close()
-	// The reader consumes the writer's read direction.
-	reader.readPrefix = writer.writePrefix
 
 	payload := strings.Repeat("fed-arisha-payload-", 4000) // ~72 KB
 	go func() { _, _ = writer.Write([]byte(payload)) }()
 
 	buf := make([]byte, len(payload)+16)
-	got := 0
+	var got atomic.Int64
 	done := make(chan error, 1)
 	go func() {
-		for got < len(payload) {
-			n, err := reader.Read(buf[got:])
-			got += n
+		for int(got.Load()) < len(payload) {
+			n, err := reader.Read(buf[got.Load():])
+			got.Add(int64(n))
 			if err != nil {
-				done <- fmt.Errorf("read failed after %d bytes: %w", got, err)
+				done <- fmt.Errorf("read failed after %d bytes: %w", got.Load(), err)
 				return
 			}
 		}
@@ -193,9 +197,9 @@ func TestFlakyBackendStillDeliversEveryByteInOrder(t *testing.T) {
 			t.Fatalf("%v", err)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatalf("reader wedged after %d of %d bytes — a dropped file, the exact stall we are fixing", got, len(payload))
+		t.Fatalf("reader wedged after %d of %d bytes — a dropped file, the exact stall we are fixing", got.Load(), len(payload))
 	}
-	if string(buf[:got]) != payload {
-		t.Fatalf("stream corrupted: got %d bytes, content differs from what was written", got)
+	if string(buf[:got.Load()]) != payload {
+		t.Fatalf("stream corrupted: got %d bytes, content differs from what was written", got.Load())
 	}
 }
