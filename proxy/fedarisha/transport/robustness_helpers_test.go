@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
@@ -17,6 +18,14 @@ func captureLog(w io.Writer) func() {
 	return func() {
 		log.SetOutput(prevOut)
 		log.SetFlags(prevFlags)
+	}
+}
+
+// plant writes a file straight into the fake store, for specs that need a file
+// on the backend without going through the write pipeline.
+func plant(f *fakeStore, path string, data []byte) {
+	if err := f.Upload(context.Background(), path, data); err != nil {
+		panic(err)
 	}
 }
 

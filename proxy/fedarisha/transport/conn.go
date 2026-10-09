@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"context"
 	"crypto/cipher"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,8 +27,16 @@ type Conn struct {
 	writePrefix string
 	readPrefix  string
 
+	// Sequence counters. writeSeq is advanced only under writeMu (see sliceChunksLocked);
+	// readSeq only by the pollLoop goroutine (see fetchNext). Close() runs on a
+	// different goroutine and used to read both straight out of these fields in its
+	// log line, which is a data race against pollLoop — hence the atomic mirrors
+	// used for reporting.
 	writeSeq uint64
 	readSeq  uint64
+	// seqSnapshot mirrors writeSeq/readSeq for lock-free reporting.
+	writeSeqSnapshot atomic.Uint64
+	readSeqSnapshot  atomic.Uint64
 
 	// Read buffer: pollLoop deposits data here, Read() consumes it.
 	readBuf  bytes.Buffer
@@ -84,6 +93,18 @@ type Conn struct {
 	s3Gets      atomic.Int64
 	s3PutErrors atomic.Int64
 	s3GetErrors atomic.Int64
+
+	// readTimeoutNanos is the current per-GET budget, stretched while reads keep
+	// timing out and pulled back on the first success. Atomic: downloadWithTimeout
+	// runs on the per-file goroutines of a fetch round.
+	readTimeoutNanos atomic.Int64
+	readTimeouts     atomic.Int64
+
+	// readSem bounds read GETs that are actually in flight on the wire. The cap
+	// has to be enforced per ATTEMPT, not per file: a hedged read fires a second
+	// request, so a per-file limit let twice maxReadConcurrency requests reach the
+	// backend at once — which is how the original 48 became a 48-connection burst.
+	readSem chan struct{}
 
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -153,11 +174,20 @@ const (
 // of the read S3 pool used so it can't starve unrelated work.
 const (
 	maxReadBatch = 64
-	// Read GETs in flight cap. With List-confirmed fetches there are no wasted
-	// 404s, so this can be generous to keep many multiplexed streams fed under a
-	// parallel download flood without one stream starving the others. Bounded
-	// below the read pool's 96 connections, leaving headroom for List calls.
-	maxReadConcurrency = 48
+	// Read GETs in flight cap. This used to be 48, which is most of the read pool
+	// and was itself the cause of the stall: a parallel-download burst drove the
+	// backend's tail latency up until responses no longer fit the GET budget, and
+	// every one of those requests then looked like a missing file to the consumer
+	// (beta observation 2026-10-09: get_errs 39-45, put_errs 0, ~4 min outage).
+	// 16 keeps every multiplexed stream fed while leaving the pool — and the
+	// headroom for List calls — free of a self-inflicted stampede.
+	maxReadConcurrency = 16
+
+	// readPoolConnections mirrors the read pool the S3 backend opens (96 in
+	// storage/s3). The read-concurrency cap must stay comfortably below it so a
+	// fetch round cannot saturate the pool the DELETEs of consumed files also
+	// need.
+	readPoolConnections = 96
 )
 
 // holeTimeout bounds how long a missing readSeq file (with later files already
@@ -167,22 +197,76 @@ const (
 // giving ~holeTimeout recovery instead of the keepalive's tens of seconds.
 // Set above the hedged-PUT budget (uploadHedgeDelay × a couple attempts) so a
 // merely-slow file gets overcome by a hedge before the watchdog re-dials.
-const holeTimeout = 7 * time.Second
+//
+// 7s was not above that budget: uploadHedgeLarge alone is 3s and uploadTimeout is
+// 8s, so under load the watchdog tore down sessions while a legitimate PUT was
+// still in flight (beta observation 2026-10-09 — the teardown, not the producer,
+// was the outage). 25s outlives the full upload budget with room to spare, and
+// still recovers in a fraction of the keepalive window.
+const holeTimeout = 25 * time.Second
 
 // Hedged GETs. A healthy GET returns in a few hundred ms; a tail (a transient
 // error pushed the AWS SDK into a multi-second backoff-retry, or a connection
 // hung) would otherwise freeze the whole in-order batch. Instead of waiting one
 // slow request out, if it hasn't answered within readHedgeDelay we fire a
 // duplicate on a fresh request and take whichever returns first — so a tail
-// costs ~readHedgeDelay + a normal GET, not seconds. readGetTimeout is the hard
-// cap across all attempts; readGetAttempts bounds how many duplicates we fire.
-// Because List already confirmed the file exists, a GET should not 404 — so a
-// retry here only covers genuine transient transport errors.
+// costs ~readHedgeDelay + a normal GET, not seconds. readGetAttempts bounds how
+// many duplicates we fire. Because List already confirmed the file exists, a GET
+// should not 404 — so a retry here only covers genuine transient transport
+// errors.
+//
+// The per-GET budget is NOT a constant: readTimeoutFloor is the interactive
+// default, and it stretches toward readTimeoutCeiling while reads keep timing
+// out (see Conn.noteReadTimeout / Conn.currentReadTimeout). With a fixed 1.2s
+// budget a loaded backend turned every tail into a "hole" the watchdog then
+// escalated into a session teardown (beta observation 2026-10-09), which cost
+// minutes of dead time instead of one slow read.
 const (
 	readHedgeDelay  = 400 * time.Millisecond
-	readGetTimeout  = 1200 * time.Millisecond
 	readGetAttempts = 2
+
+	// readTimeoutFloor is the budget for a healthy read: what an interactive
+	// round trip pays while nothing is wrong.
+	readTimeoutFloor = 1200 * time.Millisecond
+	// readTimeoutCeiling is the worst-case budget a persistently slow backend can
+	// push a single GET to. High enough to absorb a throttled or saturated
+	// backend, low enough that a genuinely dead read still fails fast.
+	readTimeoutCeiling = 4 * time.Second
+	// readTimeoutStep is how much each consecutive timeout stretches the budget.
+	readTimeoutStep = 400 * time.Millisecond
 )
+
+// currentReadTimeout is the per-GET budget this connection is currently using.
+func (c *Conn) currentReadTimeout() time.Duration {
+	if v := c.readTimeoutNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return readTimeoutFloor
+}
+
+// noteReadTimeout stretches the GET budget by one step, up to the ceiling. Called
+// when a read attempt runs out of time rather than failing fast — the signature
+// of a loaded backend, not of a missing file.
+func (c *Conn) noteReadTimeout() {
+	c.readTimeouts.Add(1)
+	next := c.currentReadTimeout() + readTimeoutStep
+	if next > readTimeoutCeiling {
+		next = readTimeoutCeiling
+	}
+	c.readTimeoutNanos.Store(int64(next))
+}
+
+// noteReadOK pulls the GET budget back one step (a success is evidence the
+// backend is healthy again). Resetting to the floor outright would over-react to
+// a single fast read in the middle of a burst, so it decays instead.
+func (c *Conn) noteReadOK() {
+	next := c.currentReadTimeout() - readTimeoutStep
+	if next < readTimeoutFloor {
+		next = readTimeoutFloor
+	}
+	c.readTimeoutNanos.Store(int64(next))
+	c.readTimeouts.Store(0)
+}
 
 func NewConn(cfg ConnConfig) *Conn {
 	if cfg.PollInterval == 0 {
@@ -227,6 +311,7 @@ func NewConn(cfg ConnConfig) *Conn {
 		prefetchCache: make(map[uint64][]byte),
 		userPrefix:    cfg.UserPrefix,
 		inboundTag:    cfg.InboundTag,
+		readSem:       make(chan struct{}, maxReadConcurrency),
 	}
 	c.readCond = sync.NewCond(&c.readMu)
 
@@ -313,7 +398,8 @@ func (c *Conn) Write(b []byte) (int, error) {
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		log.Printf("[fedarisha] session %s Close() called (S3 puts: %d, gets: %d, put_errs: %d, get_errs: %d, write_seq: %d, read_seq: %d)",
-			c.sessionID[:8], c.s3Puts.Load(), c.s3Gets.Load(), c.s3PutErrors.Load(), c.s3GetErrors.Load(), c.writeSeq, c.readSeq)
+			c.sessionID[:8], c.s3Puts.Load(), c.s3Gets.Load(), c.s3PutErrors.Load(), c.s3GetErrors.Load(),
+			c.writeSeqSnapshot.Load(), c.readSeqSnapshot.Load())
 		if c.webhookHub != nil {
 			c.webhookHub.Unregister(c.sessionID)
 		}
@@ -544,6 +630,7 @@ func (c *Conn) sliceChunksLocked(data []byte) []pendingChunk {
 		chunks = append(chunks, pendingChunk{seq: c.writeSeq, data: chunk})
 		c.writeSeq++
 	}
+	c.writeSeqSnapshot.Store(c.writeSeq)
 	return chunks
 }
 
@@ -764,7 +851,11 @@ func (c *Conn) fetchNext() int {
 		err  error
 	}
 	results := make(map[uint64]fetched, maxReadBatch)
-	sem := make(chan struct{}, maxReadConcurrency)
+	// The in-flight cap lives on the connection (Conn.readSem) and is taken per
+	// request inside downloadWithTimeout, so a hedged read cannot double the
+	// number of GETs on the wire. Here we only bound how many files one round
+	// may work on.
+	sem := make(chan struct{}, maxReadBatch)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	// Fetch at most maxReadBatch present files this round. We scan a bit past
@@ -847,6 +938,7 @@ func (c *Conn) fetchNext() int {
 		c.lastRecvMu.Unlock()
 
 		c.readSeq++
+		c.readSeqSnapshot.Store(c.readSeq)
 		consumed++
 
 		// Detached delete (robust against a Close race cancelling c.ctx).
@@ -908,12 +1000,24 @@ func (c *Conn) downloadWithTimeout(path string) ([]byte, error) {
 		err  error
 	}
 
-	ctx, cancel := context.WithTimeout(c.ctx, readGetTimeout)
+	// The budget stretches while the backend stays slow (see noteReadTimeout) so
+	// a loaded read is not misread as a missing file.
+	budget := c.currentReadTimeout()
+	ctx, cancel := context.WithTimeout(c.ctx, budget)
 	defer cancel()
 
 	resCh := make(chan res, readGetAttempts)
 	get := func() {
+		// Take a slot for the duration of the request so the in-flight cap counts
+		// real requests. A hedge that fires while every slot is busy simply waits
+		// its turn instead of pushing past the cap.
+		select {
+		case c.readSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		data, err := c.store.Download(ctx, path)
+		<-c.readSem
 		c.s3Gets.Add(1)
 		if err != nil {
 			c.s3GetErrors.Add(1)
@@ -936,7 +1040,18 @@ func (c *Conn) downloadWithTimeout(path string) ([]byte, error) {
 		case r := <-resCh:
 			inflight--
 			if r.err == nil {
+				// A completed read is evidence the backend is keeping up.
+				c.noteReadOK()
 				return r.data, nil // first success wins; defer cancel() stops the rest
+			}
+			// Surface the failure. Beta observation 2026-10-09: every transient
+			// read error (throttling, tail timeouts) was swallowed here, so an
+			// operator watching the log saw only the get_errs counter and had to
+			// fork the core to learn what was actually failing.
+			log.Printf("[fedarisha:%s] read GET failed (budget %v, attempt %d): %v",
+				c.sessionID[:8], budget, readGetAttempts, r.err)
+			if errors.Is(r.err, context.DeadlineExceeded) {
+				c.noteReadTimeout()
 			}
 			lastErr = r.err
 			// Nothing else in flight (a fast frontier error, or every dupe
@@ -954,6 +1069,13 @@ func (c *Conn) downloadWithTimeout(path string) ([]byte, error) {
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
+			// The whole budget expired without a single answered request — the
+			// backend is not merely slow on this file, it is saturated.
+			if errors.Is(lastErr, context.DeadlineExceeded) {
+				c.noteReadTimeout()
+			}
+			log.Printf("[fedarisha:%s] read GET budget exhausted (%v): %v",
+				c.sessionID[:8], budget, lastErr)
 			return nil, lastErr
 		}
 	}
