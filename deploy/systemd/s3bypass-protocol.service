@@ -1,0 +1,49 @@
+[Unit]
+Description=S3 Bypass Protocol — fedarisha server (our hardened core)
+Documentation=https://github.com/thevladimirzh/s3-bypass-protocol
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s3bypass
+Group=s3bypass
+WorkingDirectory=/opt/s3-bypass-protocol
+
+# The server config holds storage credentials — keep it root-owned and 0600.
+ExecStartPre=/usr/bin/test -r /etc/s3-bypass-protocol/server.json
+ExecStart=/opt/s3-bypass-protocol/xray run -c /etc/s3-bypass-protocol/server.json
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5s
+# Backing off hard on a broken config is better than a restart loop that
+# hammers the S3 API.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# The core logs to stdout; let journald keep it.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=s3bypass-protocol
+
+# Hardening: this process needs its config and the network, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/opt/s3-bypass-protocol
+# The only writable path is its own state dir, not needed today — the server is
+# stateless apart from the bucket.
+ReadWritePaths=/var/lib/s3-bypass-protocol
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
