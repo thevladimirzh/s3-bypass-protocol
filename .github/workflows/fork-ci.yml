@@ -24,12 +24,11 @@ jobs:
           go-version: '1.27'
           check-latest: true
 
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l proxy/fedarisha/)
-          if [ -n "$unformatted" ]; then
-            echo "gofmt needed on:"; echo "$unformatted"; exit 1
-          fi
+      - name: format check
+        # Use the project's own vformat (gofumpt-based), not plain gofmt: the
+        # inherited check-format job uses it, and plain gofmt accepts files it
+        # rejects — which is how a spec slipped through and reddened the build.
+        run: go run ./infra/vformat/main.go -mode check
 
       - name: vet
         run: go vet ./proxy/fedarisha/...

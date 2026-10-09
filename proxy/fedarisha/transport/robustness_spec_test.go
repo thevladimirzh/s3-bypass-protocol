@@ -61,6 +61,7 @@ func (f *fakeStore) Upload(_ context.Context, path string, data []byte) error {
 	f.files[path] = append([]byte(nil), data...)
 	return nil
 }
+
 func (f *fakeStore) Download(_ context.Context, path string) ([]byte, error) {
 	f.mu.Lock()
 	f.gets++
@@ -78,6 +79,7 @@ func (f *fakeStore) Download(_ context.Context, path string) ([]byte, error) {
 	}
 	return append([]byte(nil), data...), nil
 }
+
 func (f *fakeStore) List(_ context.Context, dir string, prefix string) ([]storage.FileInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -103,12 +105,14 @@ func (f *fakeStore) List(_ context.Context, dir string, prefix string) ([]storag
 	}
 	return out, nil
 }
+
 func (f *fakeStore) Delete(_ context.Context, path string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.files, path)
 	return nil
 }
+
 func (f *fakeStore) Watch(context.Context, string, time.Time, time.Duration) ([]storage.FileInfo, error) {
 	return nil, nil
 }
