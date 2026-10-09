@@ -31,9 +31,34 @@ outage.
 | ACK wait | flat `60s` poll | `5s / 10s / 20s / 30s` backoff | A flat wait cost a minute of dead time per failed handshake; three of them were the 4-minute outage |
 | GET error reporting | swallowed, only a counter | logged with the underlying error | Diagnosis previously required forking the core |
 | `Close()` counters | data race against the poll loop | atomic snapshots | Reported by `-race`; the log line raced with the reader |
+| Upload retry | hot loop: an immediate re-fire when every attempt failed | the error is returned and the caller spaces retries | Measured at over a million PUTs in 600 ms against a store rejecting everything |
+| **Dropped files** | `uploadAttempts` tries, then the file was abandoned | `uploadUntilDelivered` retries until the backend takes it or the session ends | **Root cause of the stall**: the peer reads strictly in order, so one dropped object is a permanent hole (`hole at seq 12 … 120 present`) |
+| Handshake writes | hello and ACK written once each | retried with the same pacing | One rejected request killed an otherwise healthy session |
 
 **The wire protocol is untouched.** Session layout, file naming and encryption
-are unchanged, so this core still interoperates with the upstream server.
+are unchanged, so this core still interoperates with the upstream server on
+both sides.
+
+## Why the delivery guarantee matters
+
+A writer that gives up on a file is not merely late. The peer consumes strictly
+in sequence and there is no in-protocol way to skip a missing object, so the
+session wedges until it is torn down. That is the stall we hit under load. A
+consumer-side patch cannot repair a lost byte — so the writer must either
+deliver the file or die trying, which is what `uploadUntilDelivered` does.
+
+## Testing without a VPS
+
+Both ends of the protocol live in this repo and `storage/local` implements the
+storage interface over a directory, so `Listener` + `Dialer` pairs run in a
+single process against a temp dir:
+
+- a session carries payloads both ways, byte for byte;
+- four parallel sessions each arrive complete;
+- a ~2 MB stream spans many chunk files with no hole and no corruption;
+- with a backend rejecting every 4th upload, the stream still arrives intact.
+
+These stand specs live in `proxy/fedarisha/transport/endtoend_spec_test.go`.
 
 ## Verification
 
@@ -49,7 +74,8 @@ assets, not related to this fork): `app/router`, `common/geodata`,
 `infra/conf`.
 
 Specs for the robustness behaviour live in
-`proxy/fedarisha/transport/robustness_spec_test.go`.
+`proxy/fedarisha/transport/robustness_spec_test.go`; the delivery guarantee in
+`delivery_spec_test.go`.
 
 ## Relationship to s3-bypass-desktop
 
