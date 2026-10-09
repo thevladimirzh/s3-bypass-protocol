@@ -54,8 +54,14 @@ jobs:
             fi
           done
 
+      # The geodata/wintun assets are downloaded at runtime by the geo features;
+      # the fedarisha engine does not embed them. In a fork the dispatch below is
+      # refused outright ("Resource not accessible by integration"), which used to
+      # fail the whole release before a single binary was built. Treat a failed
+      # fetch as advisory so a release can still be produced.
       - name: Trigger Asset Update Workflow if Assets Missing
         if: steps.check-assets.outputs.missing == 'true'
+        continue-on-error: true
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
