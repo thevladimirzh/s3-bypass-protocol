@@ -103,10 +103,26 @@ writeFileSync(serverPath, JSON.stringify(server, null, 2), { mode: 0o600 })
 // --- clients ----------------------------------------------------------------
 // Shape matches what the desktop client accepts: one loopback SOCKS inbound and
 // a fedarisha outbound. sessionsDir is <user>/sessions — the whole point.
+//
+// routing + dns follow the profile that is known to work in the field rather
+// than being invented here: the engine must reach the bucket over the direct
+// path, and a profile that pins the storage endpoint there is the shape proven
+// under load. Core-originated API calls do not traverse routing rules, so this
+// is defensive — but a generated config should match the reference instead of
+// being subtly different from it.
+const endpointHost = (() => {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return endpoint.replace(/^https?:\/\//, '').split('/')[0];
+  }
+})();
+
 const clientPaths = []
 for (const user of users) {
   const client = {
     log: { loglevel: 'warning' },
+    dns: { servers: ['8.8.8.8', '1.1.1.1'] },
     inbounds: [
       {
         tag: 'socks-in',
@@ -141,6 +157,10 @@ for (const user of users) {
       },
       { tag: 'direct', protocol: 'freedom', settings: {} },
     ],
+    routing: {
+      domainStrategy: 'IPIfNonMatch',
+      rules: [{ type: 'field', domain: [endpointHost], outboundTag: 'direct' }],
+    },
   }
   const p = join(outDir, `client-${user}.json`)
   writeFileSync(p, JSON.stringify(client, null, 2), { mode: 0o600 })
