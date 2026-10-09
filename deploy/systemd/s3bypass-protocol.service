@@ -8,11 +8,11 @@ Wants=network-online.target
 Type=simple
 User=s3bypass
 Group=s3bypass
-WorkingDirectory=/opt/s3-bypass-protocol
+WorkingDirectory=/opt/s3bypass-protocol
 
 # The server config holds storage credentials — keep it root-owned and 0600.
-ExecStartPre=/usr/bin/test -r /etc/s3-bypass-protocol/server.json
-ExecStart=/opt/s3-bypass-protocol/xray run -c /etc/s3-bypass-protocol/server.json
+ExecStartPre=/usr/bin/test -r /etc/s3bypass-protocol/server.json
+ExecStart=/opt/s3bypass-protocol/xray run -c /etc/s3bypass-protocol/server.json
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
@@ -36,7 +36,7 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadOnlyPaths=/opt/s3-bypass-protocol
+ReadOnlyPaths=/opt/s3bypass-protocol
 # The only writable path is its own state dir, not needed today — the server is
 # stateless apart from the bucket.
 ReadWritePaths=/var/lib/s3-bypass-protocol
