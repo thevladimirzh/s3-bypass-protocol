@@ -291,7 +291,7 @@ func (l *Listener) acceptSession(sessDir string) {
 
 	// Write ACK with server's public key.
 	ackPath := sessDir + "/" + AckFile
-	if err := l.Store.Upload(l.ctx, ackPath, pubKey); err != nil {
+	if err := uploadRetrying(l.ctx, l.Store, ackPath, pubKey, "ack"); err != nil {
 		log.Printf("[fedarisha-server] failed to ACK session %s: %v", sessID[:8], err)
 		return
 	}
