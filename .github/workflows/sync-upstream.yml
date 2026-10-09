@@ -48,7 +48,7 @@ jobs:
       # Go is set up BEFORE the merge because the merge step may need
       # `go mod tidy` to auto-resolve go.mod/go.sum conflicts (see below).
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: true
