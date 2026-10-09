@@ -49,6 +49,18 @@ const secretKey = secretFile ? readFileSync(resolve(secretFile), 'utf8').trim() 
 const users = (flag('users') ?? '').split(',').map((u) => u.trim()).filter(Boolean)
 const outDir = resolve(flag('out-dir') ?? './out')
 const serverPort = Number(flag('server-port') ?? 8443)
+// Which client shapes to emit. They differ in one place that matters: the
+// Android client runs a system VpnService and hands the core a tun fd, so its
+// profile must carry a tun inbound — while the desktop app supports a local
+// SOCKS listener only and *rejects* a tun entry at import (E-VAL-014).
+const variantsArg = flag('variants') ?? 'desktop,android'
+const variants = variantsArg.split(',').map((v) => v.trim()).filter(Boolean)
+for (const v of variants) {
+  if (!['desktop', 'android'].includes(v)) {
+    console.error(`--variants accepts desktop and/or android, got "${v}"`)
+    process.exit(2)
+  }
+}
 
 if (users.length === 0) {
   console.error('missing required flag --users (comma-separated, e.g. --users vasya,petya)')
@@ -120,18 +132,9 @@ const endpointHost = (() => {
 
 const clientPaths = []
 for (const user of users) {
-  const client = {
+  const shared = {
     log: { loglevel: 'warning' },
     dns: { servers: ['8.8.8.8', '1.1.1.1'] },
-    inbounds: [
-      {
-        tag: 'socks-in',
-        listen: '127.0.0.1',
-        port: 10808,
-        protocol: 'socks',
-        settings: { auth: 'noauth', udp: true },
-      },
-    ],
     outbounds: [
       {
         tag: 'proxy',
@@ -162,20 +165,69 @@ for (const user of users) {
       rules: [{ type: 'field', domain: [endpointHost], outboundTag: 'direct' }],
     },
   }
-  const p = join(outDir, `client-${user}.json`)
-  writeFileSync(p, JSON.stringify(client, null, 2), { mode: 0o600 })
-  clientPaths.push(p)
+
+  // Desktop: a local SOCKS listener is the whole inbound surface. The app pins
+  // it to loopback itself; adding a tun entry here would fail import validation.
+  const desktop = {
+    ...shared,
+    inbounds: [
+      {
+        tag: 'socks-in',
+        listen: '127.0.0.1',
+        port: 10808,
+        protocol: 'socks',
+        settings: { auth: 'noauth', udp: true },
+      },
+    ],
+  }
+
+  // Android: the app's VpnService establishes the interface and passes its fd
+  // to the core, so the profile needs the matching tun inbound. Values mirror a
+  // working Android profile (mtu 1500, interface name xray0).
+  const android = {
+    ...shared,
+    log: { loglevel: 'info' },
+    inbounds: [
+      {
+        tag: 'socks-in',
+        listen: '127.0.0.1',
+        port: 10808,
+        protocol: 'socks',
+        settings: { auth: 'noauth', udp: true },
+      },
+      {
+        tag: 'tun',
+        protocol: 'tun',
+        settings: { mtu: 1500, name: 'xray0', userLevel: 8 },
+        sniffing: { enabled: true, destOverride: ['http', 'tls', 'quic'] },
+      },
+    ],
+  }
+
+  const wanted = [
+    ['desktop', desktop, `client-${user}.json`],
+    ['android', android, `client-${user}-android.json`],
+  ].filter(([variant]) => variants.includes(variant))
+
+  for (const [, config, name] of wanted) {
+    const p = join(outDir, name)
+    writeFileSync(p, JSON.stringify(config, null, 2), { mode: 0o600 })
+    clientPaths.push([name, config])
+  }
 }
 
 console.log('written:')
 console.log(`  ${serverPath}   (clients: ${users.join(', ')})`)
-for (const p of clientPaths) console.log(`  ${p}`)
+for (const [name] of clientPaths) console.log(`  ${join(outDir, name)}`)
 console.log('checks:')
+console.log(`  variants                     ${variants.join(', ')}`)
 console.log(`  prefix ends with slash      ${prefix.endsWith('/')}`)
 console.log(`  credentials present         ${Boolean(accessKey && secretKey)}`)
 console.log(`  sessionsDir per user        ${users.map((u) => `${u}/sessions`).join(', ')}`)
 console.log(`  server sessionsDir          sessions (server scans <user>/sessions)`)
+console.log(`  endpoint pinned direct      ${endpointHost}`)
 console.log('')
 console.log('Next:')
 console.log(`  sudo install -o root -g s3bypass -m 640 ${serverPath} /etc/s3bypass-protocol/server.json`)
-console.log('  hand each client-<user>.json to that user — it goes straight into the desktop app')
+console.log('  client-<user>.json          → desktop app (local SOCKS only)')
+console.log('  client-<user>-android.json  → Android app (SOCKS + tun, for its VPN mode)')
