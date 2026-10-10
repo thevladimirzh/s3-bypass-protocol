@@ -66,6 +66,13 @@ type Conn struct {
 	// Active transfer tracking — suppress backoff when data is flowing.
 	lastRecvActive atomic.Int64 // unix nano of last successful fetch
 
+	// listErrLastLog is the unix nano of the last reported List failure; zero
+	// means none has been reported yet. Polls run every 90ms when a session is
+	// active, so an unthrottled error line is a flood that costs more than it
+	// explains. Atomic because fetchNext is reachable from outside the poll
+	// loop as well, so two reporters cannot tear the struct.
+	listErrLastLog atomic.Int64
+
 	lastFlush time.Time // time of last actual flush
 
 	// holeSince marks when we first noticed a "hole": later files present but
@@ -187,10 +194,51 @@ var (
 	uploadRetryMaxDelay = 5 * time.Second
 )
 
-// listTimeout bounds a single List call. A healthy List is ~50ms; this is
-// eighty times that, so only a backend that has stopped answering reaches it.
-// Overridden in tests.
-var listTimeout = 4 * time.Second
+// listTimeoutDefault bounds a single List call. A healthy List is ~50ms; this
+// is eighty times that, so only a backend that has stopped answering reaches
+// it, and it is kept at readTimeoutCeiling so a wedged backend is unsticked no
+// slower than a slow GET already is.
+const listTimeoutDefault = 4 * time.Second
+
+// listTimeoutNanos carries listTimeoutDefault so it can be shortened in tests
+// while the poll loop is running. A plain var would be a data race between the
+// test writing it and the goroutine it is shortening the deadline for — Close
+// deliberately does not wait for pollLoop, so that goroutine outlives the call
+// that started it. Zero means "unset", exactly as currentReadTimeout treats its
+// own counter.
+var listTimeoutNanos atomic.Int64
+
+func currentListTimeout() time.Duration {
+	if v := listTimeoutNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return listTimeoutDefault
+}
+
+// listErrLogInterval paces repeated List failures. The first one is always
+// reported; after that, one line per interval is enough to show the backend
+// is still failing while keeping a 90ms poll loop from turning a single
+// outage into a log flood.
+const listErrLogInterval = 30 * time.Second
+
+// noteListFailure reports a failed List.
+//
+// The error was previously dropped with a comment calling it transient. It is
+// worth retrying — pollLoop backs off and tries again — but "retry" is not a
+// diagnosis: a permanent failure (denied ListBucket on restricted credentials,
+// a bucket that no longer exists) looks identical from inside the loop and was
+// retried in silence until the session was written off as broken.
+//
+// Two callers racing through the interval check costs one extra log line. That
+// is the right trade against a lock on the poll loop's hot path.
+func (c *Conn) noteListFailure(err error) {
+	now := time.Now()
+	if last := c.listErrLastLog.Load(); last != 0 && now.Sub(time.Unix(0, last)) < listErrLogInterval {
+		return
+	}
+	c.listErrLastLog.Store(now.UnixNano())
+	log.Printf("[fedarisha:%s] read list failed (retrying): %v", shortID(c.sessionID), err)
+}
 
 // Read batching bounds. Each poll Lists the session dir (cheap, strongly
 // consistent on Ceph) and fetches up to maxReadBatch present files starting at
@@ -981,9 +1029,14 @@ func (c *Conn) pollLoop() {
 func (c *Conn) fetchNext() int {
 	fetchStart := time.Now()
 
-	infos, err := c.store.List(c.ctx, c.sessDir, c.readPrefix)
+	listCtx, cancel := context.WithTimeout(c.ctx, currentListTimeout())
+	infos, err := c.store.List(listCtx, c.sessDir, c.readPrefix)
+	cancel()
 	if err != nil {
-		return 0 // transient list error — pollLoop backs off and retries
+		// Transient: pollLoop backs off and retries. The deadline above is what
+		// keeps "retries" from meaning "pins itself on the first call".
+		c.noteListFailure(err)
+		return 0
 	}
 	present := make(map[uint64]struct{}, len(infos))
 	for _, fi := range infos {

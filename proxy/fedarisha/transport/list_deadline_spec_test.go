@@ -27,31 +27,74 @@ import (
 // a bucket that is gone — produced the same silence, retried every 90ms
 // forever, at real cost per request, with zero evidence in the log.
 
-// deadlineStore reports whether the context it was handed carries a deadline,
-// and otherwise defers to the wrapped store. Real backends honour ctx (the
-// S3 SDK does), so a fake that ignores it cannot stand in for one: a timeout
-// spec written against a ctx-ignoring fake would fail even after the fix.
+// deadlineStore records every List it serves: how many, and whether the context
+// carried a deadline. The two are kept apart on purpose — a spec that waits for
+// "a deadline appeared" cannot tell "never called" from "called without one",
+// and reports the wrong cause for a real failure. Real backends honour ctx (the
+// S3 SDK does), so a fake that ignores it cannot stand in for one either: a
+// timeout spec written against a ctx-ignoring fake would fail even after the
+// fix.
 type deadlineStore struct {
 	storage.Storage
 
 	mu       sync.Mutex
-	deadline time.Time
+	calls    int
 	had      bool
+	deadline time.Time
 }
 
 func (d *deadlineStore) List(ctx context.Context, dir, prefix string) ([]storage.FileInfo, error) {
 	dl, ok := ctx.Deadline()
 	d.mu.Lock()
-	d.had = ok
-	d.deadline = dl
+	d.calls++
+	if ok {
+		d.had, d.deadline = true, dl
+	}
 	d.mu.Unlock()
 	return d.Storage.List(ctx, dir, prefix)
 }
 
-func (d *deadlineStore) sawDeadline() (bool, time.Time) {
+func (d *deadlineStore) observed() (calls int, had bool, dl time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.had, d.deadline
+	return d.calls, d.had, d.deadline
+}
+
+// syncBuffer is a concurrency-safe log sink. The poll loop writes into it
+// while the test reads it, and a plain strings.Builder would be a data race
+// that shows up only under -race and only in a full-suite run — which is how
+// it got here.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *syncBuffer) has(sub string) bool { return strings.Contains(s.String(), sub) }
+
+// waitFor polls cond until it holds or the budget runs out. These specs watch
+// the poll loop rather than calling fetchNext directly: NewConn already owns
+// that goroutine, and a second caller races on the Conn's own fields.
+func waitFor(cond func() bool, budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
 }
 
 // Spec: the List call must carry a deadline of its own. The session context
@@ -62,11 +105,13 @@ func TestListCarriesItsOwnDeadline(t *testing.T) {
 	c := NewConn(ConnConfig{Store: store, SessionDir: "sessions/deadline", SessionID: GenerateSessionID()})
 	defer c.Close()
 
-	c.fetchNext()
+	if !waitFor(func() bool { calls, _, _ := store.observed(); return calls > 0 }, 10*time.Second) {
+		t.Fatalf("the poll loop never called List; the spec did not exercise the call")
+	}
 
-	had, dl := store.sawDeadline()
+	calls, had, dl := store.observed()
 	if !had {
-		t.Fatalf("List was handed a context with no deadline; a silent backend pins the read path forever")
+		t.Fatalf("List was called %d time(s) and never once carried a deadline; a silent backend pins the read path forever", calls)
 	}
 	if remaining := time.Until(dl); remaining <= 0 {
 		t.Fatalf("List deadline %v has already expired", remaining)
@@ -137,13 +182,9 @@ func TestReadPathRecoversWhenTheBackendStallsOnList(t *testing.T) {
 	// observation that matters: pinned on the first call it stays at one
 	// forever, and the session is silently dead while still looking alive.
 	const wantAttempts = 3
-	deadline := time.Now().Add(15 * time.Second)
-	for store.stalls() < wantAttempts && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := store.stalls(); got < wantAttempts {
+	if !waitFor(func() bool { return store.stalls() >= wantAttempts }, 15*time.Second) {
 		t.Fatalf("List was attempted %d time(s) during a stall; each call must be cut loose by a deadline "+
-			"so a silent backend cannot pin the read path", got)
+			"so a silent backend cannot pin the read path", store.stalls())
 	}
 
 	data, err := c.encodeTestFile(0, []byte("payload"))
@@ -173,21 +214,16 @@ func TestListFailuresAreLogged(t *testing.T) {
 	store := newFakeStore()
 	store.setListErr(errors.New("AccessDenied: ListBucket not allowed"))
 
-	var out strings.Builder
+	var out syncBuffer
 	restore := captureLog(&out)
+	defer restore()
 	c := NewConn(ConnConfig{Store: store, SessionDir: "sessions/listlog", SessionID: GenerateSessionID()})
-	c.fetchNext()
-	restore()
-	c.Close()
+	defer c.Close()
 
-	logged := out.String()
-	if logged == "" {
-		t.Fatalf("a failed List must be logged; a permanent error was retried silently forever")
+	if !waitFor(func() bool { return out.has("AccessDenied") }, 10*time.Second) {
+		t.Fatalf("a failed List must be logged; a permanent error was retried silently forever. Got: %s", out.String())
 	}
-	if !strings.Contains(logged, "AccessDenied") {
-		t.Fatalf("log must carry the underlying error, got: %s", logged)
-	}
-	if !strings.Contains(logged, "list") && !strings.Contains(logged, "List") {
-		t.Fatalf("log must identify List as the failing call, got: %s", logged)
+	if !out.has("read") {
+		t.Fatalf("log must identify the failing direction, got: %s", out.String())
 	}
 }

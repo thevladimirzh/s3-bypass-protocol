@@ -25,7 +25,7 @@ func shrinkHoleTimeout(t *testing.T, d time.Duration) {
 // shortenListTimeout is not tied to *testing.T because the recovery spec
 // needs the value in place before it constructs the Conn.
 func shortenListTimeout(d time.Duration) func() {
-	original := listTimeout
-	listTimeout = d
-	return func() { listTimeout = original }
+	original := currentListTimeout()
+	listTimeoutNanos.Store(int64(d))
+	return func() { listTimeoutNanos.Store(int64(original)) }
 }
