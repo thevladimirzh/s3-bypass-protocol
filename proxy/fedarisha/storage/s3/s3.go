@@ -80,6 +80,7 @@ func New(cfg Config) *S3Store {
 				o.Region = cfg.Region
 				o.Credentials = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
 				o.HTTPClient = hc
+				o.Retryer = newStoreRetryer()
 			},
 		}
 		if cfg.Endpoint != "" {
