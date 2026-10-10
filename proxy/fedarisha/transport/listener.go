@@ -291,7 +291,7 @@ func (l *Listener) acceptSession(sessDir string) {
 		l.known[sessDir] = true
 		l.knownMu.Unlock()
 		_ = l.Store.Delete(l.ctx, sessDir+"/"+HelloFile)
-		log.Printf("[fedarisha-server] session %s rejected: user %q not allowed", sessID[:8], userPrefix)
+		log.Printf("[fedarisha-server] session %s rejected: user %q not allowed", shortID(sessID), userPrefix)
 		return
 	}
 
@@ -316,12 +316,12 @@ func (l *Listener) acceptSession(sessDir string) {
 
 	// Extract client public key from hello (after sessID).
 	if len(data) < len(sessID)+32 {
-		log.Printf("[fedarisha-server] session %s: hello too short for key exchange", sessID[:8])
+		log.Printf("[fedarisha-server] session %s: hello too short for key exchange", shortID(sessID))
 		return
 	}
 	clientPub := data[len(sessID):][:32]
 
-	log.Printf("[fedarisha-server] new session %s in %s", sessID[:8], sessDir)
+	log.Printf("[fedarisha-server] new session %s in %s", shortID(sessID), sessDir)
 
 	l.knownMu.Lock()
 	l.known[sessDir] = true
@@ -332,20 +332,20 @@ func (l *Listener) acceptSession(sessDir string) {
 	// Generate server X25519 key pair and derive shared secret.
 	privKey, pubKey, err := GenerateX25519()
 	if err != nil {
-		log.Printf("[fedarisha-server] session %s: keygen failed: %v", sessID[:8], err)
+		log.Printf("[fedarisha-server] session %s: keygen failed: %v", shortID(sessID), err)
 		return
 	}
 
 	aead, err := DeriveAEAD(privKey, clientPub, sessID)
 	if err != nil {
-		log.Printf("[fedarisha-server] session %s: key derivation failed: %v", sessID[:8], err)
+		log.Printf("[fedarisha-server] session %s: key derivation failed: %v", shortID(sessID), err)
 		return
 	}
 
 	// Write ACK with server's public key.
 	ackPath := sessDir + "/" + AckFile
 	if err := uploadRetrying(l.ctx, l.Store, ackPath, pubKey, "ack"); err != nil {
-		log.Printf("[fedarisha-server] failed to ACK session %s: %v", sessID[:8], err)
+		log.Printf("[fedarisha-server] failed to ACK session %s: %v", shortID(sessID), err)
 		return
 	}
 
@@ -367,7 +367,7 @@ func (l *Listener) acceptSession(sessDir string) {
 	select {
 	case l.incoming <- conn:
 	default:
-		log.Printf("[fedarisha-server] incoming channel full, dropping session %s", sessID[:8])
+		log.Printf("[fedarisha-server] incoming channel full, dropping session %s", shortID(sessID))
 		conn.Close()
 	}
 }

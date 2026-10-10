@@ -98,7 +98,7 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 	sessID := GenerateSessionID()
 	sessDir := effectiveSessionsDir(d.SessionsDir) + "/" + sessID
 
-	log.Printf("[fedarisha-client] dialing new session %s", sessID[:8])
+	log.Printf("[fedarisha-client] dialing new session %s", shortID(sessID))
 
 	// Generate client X25519 key pair.
 	privKey, pubKey, err := GenerateX25519()
@@ -141,11 +141,11 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 		}
 		if len(data) >= x25519KeySize {
 			serverPub = data[:x25519KeySize]
-			log.Printf("[fedarisha-client] session %s accepted by server (encrypted)", sessID[:8])
+			log.Printf("[fedarisha-client] session %s accepted by server (encrypted)", shortID(sessID))
 			_ = d.Store.Delete(ctx, ackPath)
 			break
 		}
-		log.Printf("[fedarisha-client] no ACK for session %s after %v, waiting longer", sessID[:8], window)
+		log.Printf("[fedarisha-client] no ACK for session %s after %v, waiting longer", shortID(sessID), window)
 	}
 	if serverPub == nil {
 		_ = d.Store.Delete(ctx, helloPath)

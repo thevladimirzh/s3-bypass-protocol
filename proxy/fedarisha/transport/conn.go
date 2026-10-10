@@ -313,7 +313,7 @@ func NewConn(cfg ConnConfig) *Conn {
 		flushNow:      make(chan struct{}, 1),
 		uploadQueue:   make(chan uploadJob, 64),
 		localAddr:     fedarishaAddr{tag: "fedarisha-local"},
-		remoteAddr:    fedarishaAddr{tag: "fedarisha:" + cfg.SessionID[:8]},
+		remoteAddr:    fedarishaAddr{tag: "fedarisha:" + shortID(cfg.SessionID)},
 		prefetchCache: make(map[uint64][]byte),
 		userPrefix:    cfg.UserPrefix,
 		inboundTag:    cfg.InboundTag,
@@ -404,7 +404,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		log.Printf("[fedarisha] session %s Close() called (S3 puts: %d, gets: %d, put_errs: %d, get_errs: %d, write_seq: %d, read_seq: %d)",
-			c.sessionID[:8], c.s3Puts.Load(), c.s3Gets.Load(), c.s3PutErrors.Load(), c.s3GetErrors.Load(),
+			shortID(c.sessionID), c.s3Puts.Load(), c.s3Gets.Load(), c.s3PutErrors.Load(), c.s3GetErrors.Load(),
 			c.writeSeqSnapshot.Load(), c.readSeqSnapshot.Load())
 		if c.webhookHub != nil {
 			c.webhookHub.Unregister(c.sessionID)
@@ -514,9 +514,9 @@ func (c *Conn) uploadWorker() {
 		dt := time.Since(t0)
 		if err != nil {
 			c.s3PutErrors.Add(1)
-			log.Printf("[fedarisha:%s] upload ERR %s (%d B, %v): %v", c.sessionID[:8], job.path, len(job.data), dt, err)
+			log.Printf("[fedarisha:%s] upload ERR %s (%d B, %v): %v", shortID(c.sessionID), job.path, len(job.data), dt, err)
 		} else {
-			log.Printf("[fedarisha:%s] upload %s (%d B, %v)", c.sessionID[:8], job.path, len(job.data), dt)
+			log.Printf("[fedarisha:%s] upload %s (%d B, %v)", shortID(c.sessionID), job.path, len(job.data), dt)
 		}
 	}
 }
@@ -550,7 +550,7 @@ func (c *Conn) uploadUntilDelivered(path string, data []byte) error {
 			return err // session is closing — stop holding the object
 		}
 		log.Printf("[fedarisha:%s] upload retry %d for %s (%d B, attempt took %v): %v; retrying in %v",
-			c.sessionID[:8], attempt, path, len(data), time.Since(start).Round(time.Millisecond), err, delay)
+			shortID(c.sessionID), attempt, path, len(data), time.Since(start).Round(time.Millisecond), err, delay)
 
 		select {
 		case <-c.closed:
@@ -785,7 +785,7 @@ func (c *Conn) pollLoop() {
 
 		if n > 0 {
 			if emptyPolls > 0 {
-				log.Printf("[fedarisha:%s] poll: %d empty polls before data arrived", c.sessionID[:8], emptyPolls)
+				log.Printf("[fedarisha:%s] poll: %d empty polls before data arrived", shortID(c.sessionID), emptyPolls)
 				emptyPolls = 0
 			}
 			c.lastRecvActive.Store(time.Now().UnixNano())
@@ -976,12 +976,12 @@ func (c *Conn) fetchNext() int {
 
 		decrypted, e := c.decrypt(data, seq)
 		if e != nil {
-			log.Printf("[fedarisha:%s] decrypt error seq %d: %v", c.sessionID[:8], seq, e)
+			log.Printf("[fedarisha:%s] decrypt error seq %d: %v", shortID(c.sessionID), seq, e)
 			break
 		}
 		payload, e := decodePayload(decrypted)
 		if e != nil {
-			log.Printf("[fedarisha:%s] decode error: %v", c.sessionID[:8], e)
+			log.Printf("[fedarisha:%s] decode error: %v", shortID(c.sessionID), e)
 			break
 		}
 
@@ -1018,7 +1018,7 @@ func (c *Conn) fetchNext() int {
 	}
 
 	if consumed > 0 {
-		log.Printf("[fedarisha:%s] fetchNext: got %d files (%d present), total %v", c.sessionID[:8], consumed, len(present), time.Since(fetchStart))
+		log.Printf("[fedarisha:%s] fetchNext: got %d files (%d present), total %v", shortID(c.sessionID), consumed, len(present), time.Since(fetchStart))
 	}
 
 	// Hole watchdog: later files exist but we consumed nothing — readSeq is still
@@ -1036,7 +1036,7 @@ func (c *Conn) fetchNext() int {
 		c.holeSince = time.Now()
 	case time.Since(c.holeSince) > holeTimeout:
 		log.Printf("[fedarisha:%s] hole at seq %d persisted %v (%d present), closing for re-dial",
-			c.sessionID[:8], c.readSeq, time.Since(c.holeSince).Round(time.Millisecond), len(present))
+			shortID(c.sessionID), c.readSeq, time.Since(c.holeSince).Round(time.Millisecond), len(present))
 		c.Close()
 	}
 
@@ -1106,7 +1106,7 @@ func (c *Conn) downloadWithTimeout(path string) ([]byte, error) {
 			// operator watching the log saw only the get_errs counter and had to
 			// fork the core to learn what was actually failing.
 			log.Printf("[fedarisha:%s] read GET failed (budget %v, attempt %d): %v",
-				c.sessionID[:8], budget, readGetAttempts, r.err)
+				shortID(c.sessionID), budget, readGetAttempts, r.err)
 			if errors.Is(r.err, context.DeadlineExceeded) {
 				c.noteReadTimeout()
 			}
@@ -1132,7 +1132,7 @@ func (c *Conn) downloadWithTimeout(path string) ([]byte, error) {
 				c.noteReadTimeout()
 			}
 			log.Printf("[fedarisha:%s] read GET budget exhausted (%v): %v",
-				c.sessionID[:8], budget, lastErr)
+				shortID(c.sessionID), budget, lastErr)
 			return nil, lastErr
 		}
 	}
@@ -1163,7 +1163,7 @@ func (c *Conn) idleWatcher() {
 			idle := time.Since(c.lastRecv)
 			c.lastRecvMu.Unlock()
 			if idle > c.idleTimeout {
-				log.Printf("[fedarisha] session %s idle timeout (%v > %v), closing", c.sessionID[:8], idle, c.idleTimeout)
+				log.Printf("[fedarisha] session %s idle timeout (%v > %v), closing", shortID(c.sessionID), idle, c.idleTimeout)
 				c.Close()
 				return
 			}

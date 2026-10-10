@@ -113,3 +113,26 @@ func TestShortSessionIDIsStillIdentifiable(t *testing.T) {
 
 	var _ storage.Storage = store
 }
+
+// The id does not stop at acceptSession: the listener hands the same
+// externally-named id to NewConn, whose own logging slices it again. Fixing
+// only the listener moves the panic one frame down — which is what happens the
+// moment the incoming channel is full and the dropped session is closed.
+func TestShortSessionIDSurvivesConnLifecycle(t *testing.T) {
+	conn := NewConn(ConnConfig{
+		Store:      local.New(local.Config{RootDir: t.TempDir()}),
+		SessionID:  "ab",
+		SessionDir: "sessions/ab",
+		IsClient:   false,
+	})
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Conn.Close panicked on a short session id: %v", r)
+		}
+	}()
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
