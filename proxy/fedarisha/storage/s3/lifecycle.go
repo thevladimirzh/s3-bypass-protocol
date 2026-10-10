@@ -87,12 +87,57 @@ func (s *S3Store) fetchLifecycleRules(ctx context.Context) ([]s3types.LifecycleR
 
 // lifecycleRuleIDForPrefix derives a rule ID from the inbound's S3 prefix so
 // that multiple inbounds sharing a bucket get separate, addressable rules.
-// VK Cloud accepts alphanumerics plus -_. — we replace path separators with
-// dashes and collapse the trailing slash.
+// lifecycleRuleIDForPrefix derives a stable, unique rule ID from a prefix.
+//
+// Two constraints shape the encoding. VK Cloud accepts only alphanumerics plus
+// -_. in a rule ID, so a hash alone is not available — and a rejected ID means
+// no rule at all rather than a differently-named one. And the mapping has to be
+// injective, because SetupLifecycle reconciles by ID: two prefixes that produce
+// the same ID means the second inbound to start silently deletes the first's
+// expiry rule.
+//
+// Collapsing separators to dashes was many-to-one. "team-a/prod/" and
+// "team-a-prod/" both produced "fedarisha-expire-team-a-prod", so the second
+// inbound removed the first's rule and left that prefix with orphans retained
+// and billed forever. Separator and dash are both ordinary characters in a
+// directory name, and the multi-user layout puts prefixes exactly one segment
+// apart, so this was reachable with ordinary configuration.
+//
+// So anything outside the accepted set is hex-encoded with '_' as the marker,
+// and the marker is escaped along with everything else. The result stays inside
+// VK Cloud's character set, because a byte outside it becomes three bytes
+// inside it.
 func lifecycleRuleIDForPrefix(prefix string) string {
 	cleaned := strings.Trim(prefix, "/")
 	if cleaned == "" {
 		return lifecycleRuleIDPrefix + "all"
 	}
-	return lifecycleRuleIDPrefix + strings.ReplaceAll(cleaned, "/", "-")
+	return lifecycleRuleIDPrefix + lifecycleEscape(cleaned)
+}
+
+// lifecycleEscape hex-encodes every byte outside the set VK Cloud accepts.
+//
+// The marker is '_', which is inside the accepted set — '%' is not, and a
+// rejected rule ID means no rule at all rather than a differently-named one.
+// '_' is escaped as "_5F" like any other non-alphanumeric, so the marker can
+// never be confused with a literal one. That is what makes the encoding
+// injective rather than merely safe: without it, "a_2Fb" and "a/b" would both
+// encode to "a_2Fb".
+func lifecycleEscape(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '.':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('_')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
 }
