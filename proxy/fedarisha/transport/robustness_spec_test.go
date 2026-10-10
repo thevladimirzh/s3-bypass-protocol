@@ -53,6 +53,12 @@ func (f *fakeStore) setListLatency(d time.Duration) {
 	f.listDelay = d
 }
 
+func (f *fakeStore) setListErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listErr = err
+}
+
 func (f *fakeStore) Init(context.Context) error              { return nil }
 func (f *fakeStore) EnsureDir(context.Context, string) error { return nil }
 func (f *fakeStore) Upload(_ context.Context, path string, data []byte) error {

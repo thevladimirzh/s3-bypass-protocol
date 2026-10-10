@@ -21,3 +21,11 @@ func shrinkHoleTimeout(t *testing.T, d time.Duration) {
 	holeTimeout = d
 	t.Cleanup(func() { holeTimeout = original })
 }
+
+// shortenListTimeout is not tied to *testing.T because the recovery spec
+// needs the value in place before it constructs the Conn.
+func shortenListTimeout(d time.Duration) func() {
+	original := listTimeout
+	listTimeout = d
+	return func() { listTimeout = original }
+}

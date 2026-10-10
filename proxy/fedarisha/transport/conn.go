@@ -187,6 +187,11 @@ var (
 	uploadRetryMaxDelay = 5 * time.Second
 )
 
+// listTimeout bounds a single List call. A healthy List is ~50ms; this is
+// eighty times that, so only a backend that has stopped answering reaches it.
+// Overridden in tests.
+var listTimeout = 4 * time.Second
+
 // Read batching bounds. Each poll Lists the session dir (cheap, strongly
 // consistent on Ceph) and fetches up to maxReadBatch present files starting at
 // readSeq, with at most maxReadConcurrency GETs in flight. maxReadBatch caps
