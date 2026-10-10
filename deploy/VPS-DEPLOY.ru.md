@@ -269,6 +269,16 @@ Object Storage `region: ru-central1`, для VK Cloud `region: eu-east1`,
 ## Обновление
 
 ```bash
+./deploy/upgrade-server.sh --status     # что стоит сейчас
+sudo ./deploy/upgrade-server.sh --dry-run
+sudo ./deploy/upgrade-server.sh          # скачать, проверить, подменить, откатить при неудаче
+```
+
+Полная инструкция с проверкой под нагрузкой и ручным откатом —
+`deploy/UPGRADE-SERVER.ru.md`. Первая установка по-прежнему идёт через
+`install-server.sh`:
+
+```bash
 VERSION=... SHA256=... sudo -E ./deploy/install-server.sh
 sudo systemctl restart s3bypass-protocol
 ```
