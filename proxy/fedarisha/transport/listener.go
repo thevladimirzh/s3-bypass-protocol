@@ -48,6 +48,15 @@ type Listener struct {
 	noHelloSince map[string]time.Time
 	noHelloMu    sync.Mutex
 
+	// accepting holds session directories with a handshake in flight. The
+	// previous serialisation guaranteed one handshake per directory; running
+	// them concurrently has to guarantee it explicitly, or a ticker and a
+	// webhook arriving together hand the same session over twice.
+	accepting map[string]bool
+
+	// handshakeSem bounds concurrent handshakes.
+	handshakeSem chan struct{}
+
 	closeOnce sync.Once
 	addr      net.Addr
 }
@@ -98,6 +107,8 @@ func Listen(ctx context.Context, store storage.Storage, sessionsDir string, opts
 		incoming:     make(chan *Conn, 16),
 		known:        make(map[string]bool),
 		noHelloSince: make(map[string]time.Time),
+		accepting:    make(map[string]bool),
+		handshakeSem: make(chan struct{}, handshakeConcurrency),
 		addr:         fedarishaAddr{tag: "fedarisha-listener:" + sessionsDir},
 	}
 	l.applyOpts(opts)
@@ -121,6 +132,8 @@ func ListenMultiUser(ctx context.Context, store storage.Storage, sessionsDir str
 		incoming:     make(chan *Conn, 16),
 		known:        make(map[string]bool),
 		noHelloSince: make(map[string]time.Time),
+		accepting:    make(map[string]bool),
+		handshakeSem: make(chan struct{}, handshakeConcurrency),
 		addr:         fedarishaAddr{tag: "fedarisha-listener:*/" + sessionsDir},
 	}
 	l.applyOpts(opts)
@@ -189,9 +202,40 @@ func (l *Listener) watchLoop() {
 		case <-ticker.C:
 			l.scanForNewSessions()
 		case sessDir := <-webhookCh:
-			l.acceptSessionFromWebhook(sessDir)
+			l.dispatchHandshake(sessDir)
 		}
 	}
+}
+
+// handshakeConcurrency bounds how many handshakes may be in flight. Without it,
+// a burst of new sessions would spawn one goroutine each; with it, a store that
+// stops accepting writes stalls at most this many and the rest queue — which
+// still discovers them, just not all at once.
+const handshakeConcurrency = 16
+
+// dispatchHandshake runs one handshake off the watch loop.
+//
+// The handshake performs network I/O — a GET, a DELETE, a key exchange and a
+// retried PUT — and doing that on the loop's goroutine meant a store that
+// rejected a 32-byte ACK stopped the server noticing a new session for every
+// user, indefinitely, with only a few retry lines in the log.
+func (l *Listener) dispatchHandshake(sessDir string) {
+	select {
+	case l.handshakeSem <- struct{}{}:
+	default:
+		// Every slot is busy. Dropping the notification is safe: the ticker
+		// re-scans, and a directory with a hello in it is not forgotten.
+		return
+	}
+	go func() {
+		defer func() { <-l.handshakeSem }()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[fedarisha-server] handshake for %s panicked: %v", shortID(sessDir), r)
+			}
+		}()
+		l.acceptSession(sessDir)
+	}()
 }
 
 func (l *Listener) scanForNewSessions() {
@@ -233,7 +277,7 @@ func (l *Listener) scanSessionsIn(sessionsDir string) {
 			continue
 		}
 		sessDir := sessionsDir + "/" + d.Name
-		l.acceptSession(sessDir)
+		l.dispatchHandshake(sessDir)
 	}
 }
 
@@ -310,11 +354,21 @@ func (l *Listener) acceptSession(sessDir string) {
 	sessID := parts[len(parts)-1]
 
 	l.knownMu.Lock()
-	if l.known[sessDir] {
+	if l.known[sessDir] || l.accepting[sessDir] {
 		l.knownMu.Unlock()
 		return
 	}
+	// Claim the directory for the duration of the handshake. Handshakes run
+	// concurrently now, and the serialisation that used to guarantee one per
+	// directory has to be stated explicitly — otherwise a tick and a webhook
+	// arriving together hand the same session over twice.
+	l.accepting[sessDir] = true
 	l.knownMu.Unlock()
+	defer func() {
+		l.knownMu.Lock()
+		delete(l.accepting, sessDir)
+		l.knownMu.Unlock()
+	}()
 
 	// In multi-user mode the prefix is the first path segment.
 	// sessDir format: "user1/sessions/abc123" → userPrefix = "user1"
