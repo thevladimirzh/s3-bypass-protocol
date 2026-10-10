@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -24,17 +25,44 @@ type Transfer struct {
 	Err      string        `json:"err,omitempty"`
 }
 
-// Stalled reports whether this transfer is evidence of the symptom.
+// Thresholds for the two directions. They are different numbers measuring
+// different things, which is the whole reason they are not one flag.
 //
-// The threshold is on time-to-first-byte, not total duration: a large transfer
-// legitimately takes a long time, but nothing legitimate makes the FIRST byte
-// arrive seconds late. That distinction is the difference between "the tunnel
-// is slow" and "the tunnel stopped", which is the bug.
-func (t Transfer) Stalled(threshold time.Duration) bool {
+// Downloads are judged on time-to-first-byte. Nothing legitimate makes the
+// first byte of a response arrive seconds late — that is the symptom itself.
+//
+// Uploads cannot use time-to-first-byte at all. A response's headers arrive
+// only after the request body has been sent in full, so "TTFB" on an upload is
+// really "how long the body took", and at a realistic 0.8 MB/s a 4MB upload
+// crosses a 5-second line every single time. Using one threshold for both
+// directions reports a healthy tunnel as stalling on every second request,
+// which is how a measuring tool loses the room to be believed.
+type Thresholds struct {
+	DownTTFB   time.Duration
+	UpDuration time.Duration
+}
+
+// Stalled reports whether this transfer is evidence of the symptom.
+func (t Transfer) Stalled(th Thresholds) bool {
 	if t.Err != "" {
 		return true
 	}
-	return t.TTFB >= threshold
+	if t.Dir == "up" {
+		return t.Duration >= th.UpDuration
+	}
+	return t.TTFB >= th.DownTTFB
+}
+
+// Explain names the number a stall was judged on, so a report cannot be read
+// back with the wrong metric in mind.
+func (t Transfer) Explain(th Thresholds) string {
+	if t.Err != "" {
+		return "error: " + t.Err
+	}
+	if t.Dir == "up" {
+		return fmt.Sprintf("upload took %s (threshold %s)", t.Duration.Round(time.Millisecond), th.UpDuration)
+	}
+	return fmt.Sprintf("first byte after %s (threshold %s)", t.TTFB.Round(time.Millisecond), th.DownTTFB)
 }
 
 // Bucket is one slice of the run, used to make a stall visible as a hole in the
@@ -53,7 +81,7 @@ type Bucket struct {
 // Bucket width is chosen by the caller, not derived: the caller knows whether
 // it is watching for a 20-second hitch or a 5-minute outage, and a tool that
 // picks its own resolution hides exactly the thing it was pointed at.
-func Bucketize(transfers []Transfer, start time.Time, width time.Duration) []Bucket {
+func Bucketize(transfers []Transfer, start time.Time, width time.Duration, th Thresholds) []Bucket {
 	if width <= 0 {
 		return nil
 	}
@@ -81,7 +109,7 @@ func Bucketize(transfers []Transfer, start time.Time, width time.Duration) []Buc
 
 		out[i].Transfers++
 		out[i].Bytes += t.Bytes
-		if t.Stalled(bucketStallThreshold) {
+		if t.Stalled(th) {
 			out[i].Stalls++
 		}
 		if t.TTFB > out[i].MaxTTFB {
@@ -96,11 +124,6 @@ func Bucketize(transfers []Transfer, start time.Time, width time.Duration) []Buc
 	return out
 }
 
-// bucketStallThreshold is the default used when Bucketize is called without an
-// explicit threshold. Bucket-level stall counting is about spotting trouble,
-// not about the user's exact threshold, so this stays fixed and small.
-var bucketStallThreshold = 5 * time.Second
-
 // Summary is what a soak actually reports.
 type Summary struct {
 	Started    time.Time     `json:"started"`
@@ -109,12 +132,14 @@ type Summary struct {
 	Bytes      int64         `json:"bytes"`
 	Failures   int           `json:"failures"`
 	Stalls     int           `json:"stalls"`
+	StallsDown int           `json:"stallsDown"`
+	StallsUp   int           `json:"stallsUp"`
 	WorstTTFB  time.Duration `json:"worstTTFB"`
 	MedianTTFB time.Duration `json:"medianTTFB"`
 	Throughput float64       `json:"throughput"` // bytes/sec across the whole run
 }
 
-func summarize(transfers []Transfer, start, end time.Time) Summary {
+func summarize(transfers []Transfer, start, end time.Time, th Thresholds) Summary {
 	s := Summary{Started: start, Duration: end.Sub(start)}
 	ttfbs := make([]time.Duration, 0, len(transfers))
 	for _, t := range transfers {
@@ -123,8 +148,13 @@ func summarize(transfers []Transfer, start, end time.Time) Summary {
 		if t.Err != "" {
 			s.Failures++
 		}
-		if t.Stalled(bucketStallThreshold) {
+		if t.Stalled(th) {
 			s.Stalls++
+			if t.Dir == "up" {
+				s.StallsUp++
+			} else {
+				s.StallsDown++
+			}
 		}
 		if t.TTFB > s.WorstTTFB {
 			s.WorstTTFB = t.TTFB

@@ -10,27 +10,66 @@ import (
 
 // --- what counts as a stall --------------------------------------------------
 
+var testThresholds = Thresholds{DownTTFB: 5 * time.Second, UpDuration: 15 * time.Second}
+
 // Spec: the symptom is a tunnel that stops, not one that is slow. A large
 // transfer legitimately runs long; nothing legitimate makes the FIRST byte
 // arrive seconds late. Measuring the wrong half of the number would have
 // reported a healthy 10MB download as broken.
-func TestSlowTransferIsNotAStallButALateFirstByteIs(t *testing.T) {
-	slow := Transfer{TTFB: 80 * time.Millisecond, Duration: 40 * time.Second, Bytes: 10 << 20}
-	if slow.Stalled(5 * time.Second) {
-		t.Fatal("a transfer that took 40s to finish but sent its first byte in 80ms is not stalled")
+func TestSlowDownloadIsNotAStallButALateFirstByteIs(t *testing.T) {
+	slow := Transfer{Dir: "down", TTFB: 80 * time.Millisecond, Duration: 40 * time.Second, Bytes: 10 << 20}
+	if slow.Stalled(testThresholds) {
+		t.Fatal("a download that took 40s to finish but sent its first byte in 80ms is not stalled")
 	}
 
-	late := Transfer{TTFB: 20 * time.Second, Duration: 41 * time.Second, Bytes: 8 << 20}
-	if !late.Stalled(5 * time.Second) {
+	late := Transfer{Dir: "down", TTFB: 20 * time.Second, Duration: 41 * time.Second, Bytes: 8 << 20}
+	if !late.Stalled(testThresholds) {
 		t.Fatal("20s before the first byte is the exact symptom this tool exists to catch")
+	}
+}
+
+// Spec: uploads must NOT be judged on time-to-first-byte. A response's headers
+// only arrive after the request body has been sent in full, so TTFB on an
+// upload is really "how long the body took" — at a realistic ~0.8 MB/s a 4MB
+// upload crosses a 5-second line every single time.
+//
+// This is not hypothetical: the first live run reported two stalls in 65
+// seconds, both of them uploads of 5.4s that were entirely healthy.
+func TestAHealthyUploadIsNotAStall(t *testing.T) {
+	// 4MB at roughly 0.75 MB/s — an ordinary upload through the tunnel.
+	ordinary := Transfer{Dir: "up", TTFB: 5 * time.Second, Duration: 5 * time.Second, Bytes: 0}
+	if ordinary.Stalled(Thresholds{DownTTFB: 5 * time.Second, UpDuration: 15 * time.Second}) {
+		t.Fatal("a 5.4s upload is not a stall; judging uploads by time-to-first-byte reports a healthy tunnel as broken")
+	}
+
+	// Even one that trips the DOWNLOAD threshold must not be judged by it.
+	if ordinary.Stalled(Thresholds{DownTTFB: 4 * time.Second, UpDuration: 30 * time.Second}) {
+		t.Fatal("the download threshold must never be applied to an upload")
+	}
+
+	// An upload that really is stuck still has to be caught.
+	stuck := Transfer{Dir: "up", Duration: 90 * time.Second, Bytes: 0}
+	if !stuck.Stalled(testThresholds) {
+		t.Fatal("a 90-second upload is a stall and must be reported")
 	}
 }
 
 func TestFailedTransferIsAlwaysAStall(t *testing.T) {
 	// A zero TTFB with an error must not slip through as a clean fast transfer.
-	broken := Transfer{TTFB: 0, Err: "context deadline exceeded"}
-	if !broken.Stalled(5 * time.Second) {
+	broken := Transfer{Dir: "down", TTFB: 0, Err: "context deadline exceeded"}
+	if !broken.Stalled(testThresholds) {
 		t.Fatal("a failed transfer is a stall regardless of its TTFB")
+	}
+}
+
+func TestExplainNamesTheMetricItJudged(t *testing.T) {
+	up := Transfer{Dir: "up", Duration: 40 * time.Second, TTFB: 40 * time.Second}
+	if got := up.Explain(testThresholds); !strings.Contains(got, "upload took") {
+		t.Fatalf("an upload stall must be explained by duration, got %q", got)
+	}
+	down := Transfer{Dir: "down", Duration: 41 * time.Second, TTFB: 20 * time.Second}
+	if got := down.Explain(testThresholds); !strings.Contains(got, "first byte") {
+		t.Fatalf("a download stall must be explained by first-byte time, got %q", got)
 	}
 }
 
@@ -43,12 +82,12 @@ func TestBucketizeSeparatesTransfersInTime(t *testing.T) {
 	var ts []Transfer
 	// Three transfers inside the first 30s slice.
 	for i := 0; i < 3; i++ {
-		ts = append(ts, Transfer{Start: start.Add(time.Duration(i) * time.Second), Bytes: 100, TTFB: 10 * time.Millisecond})
+		ts = append(ts, Transfer{Dir: "down", Start: start.Add(time.Duration(i) * time.Second), Bytes: 100, TTFB: 10 * time.Millisecond})
 	}
 	// One, stalled, in the second slice.
-	ts = append(ts, Transfer{Start: start.Add(45 * time.Second), Bytes: 100, TTFB: 22 * time.Second})
+	ts = append(ts, Transfer{Dir: "down", Start: start.Add(45 * time.Second), Bytes: 100, TTFB: 22 * time.Second})
 
-	buckets := Bucketize(ts, start, 30*time.Second)
+	buckets := Bucketize(ts, start, 30*time.Second, testThresholds)
 	if len(buckets) != 2 {
 		t.Fatalf("want 2 slices, got %d", len(buckets))
 	}
@@ -66,12 +105,12 @@ func TestBucketizeSeparatesTransfersInTime(t *testing.T) {
 func TestSummarizeCountsStallsFailuresAndBytes(t *testing.T) {
 	start := time.Now()
 	ts := []Transfer{
-		{Start: start, TTFB: 10 * time.Millisecond, Bytes: 1000, Duration: time.Second},
-		{Start: start, TTFB: 20 * time.Millisecond, Bytes: 2000, Duration: time.Second},
-		{Start: start, TTFB: 30 * time.Second, Bytes: 500, Duration: 31 * time.Second},
-		{Start: start, TTFB: 0, Bytes: 0, Err: "connection reset"},
+		{Dir: "down", Start: start, TTFB: 10 * time.Millisecond, Bytes: 1000, Duration: time.Second},
+		{Dir: "down", Start: start, TTFB: 20 * time.Millisecond, Bytes: 2000, Duration: time.Second},
+		{Dir: "down", Start: start, TTFB: 30 * time.Second, Bytes: 500, Duration: 31 * time.Second},
+		{Dir: "down", Start: start, TTFB: 0, Bytes: 0, Err: "connection reset"},
 	}
-	s := summarize(ts, start, start.Add(10*time.Second))
+	s := summarize(ts, start, start.Add(10*time.Second), testThresholds)
 
 	if s.Transfers != 4 {
 		t.Fatalf("transfers = %d, want 4", s.Transfers)

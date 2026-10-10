@@ -80,7 +80,8 @@ var (
 	proxyAddr            = flag.String("proxy", "socks5://127.0.0.1:11080", "SOCKS5 proxy to drive traffic through")
 	duration             = flag.Duration("duration", 10*time.Minute, "how long to keep traffic flowing")
 	concurrency          = flag.Int("concurrency", 4, "parallel workers")
-	stallAfter           = flag.Duration("stall", 5*time.Second, "time-to-first-byte at or above this counts as a stall")
+	stallDown            = flag.Duration("stall", 5*time.Second, "download stall: time-to-first-byte at or above this")
+	stallUp              = flag.Duration("stall-up", 0, "upload stall: total duration at or above this (0 = 3x -stall)")
 	reqTimeout           = flag.Duration("timeout", 60*time.Second, "hard per-request ceiling")
 	downURL              = flag.String("url-down", "https://speed.cloudflare.com/__down", "download endpoint (bytes query appended)")
 	upURL                = flag.String("url-up", "https://speed.cloudflare.com/__up", "upload endpoint")
@@ -97,6 +98,15 @@ func init() {
 
 func main() {
 	flag.Parse()
+
+	th := Thresholds{DownTTFB: *stallDown}
+	th.UpDuration = *stallUp
+	if th.UpDuration == 0 {
+		// Deliberately looser than the download threshold. An upload's duration
+		// includes sending the body, so it scales with -size; this default suits
+		// small transfers and must be raised alongside the size.
+		th.UpDuration = 3 * *stallDown
+	}
 
 	proxyURL, err := url.Parse(*proxyAddr)
 	if err != nil || proxyURL.Host == "" {
@@ -140,13 +150,46 @@ func main() {
 	deadline := start.Add(*duration)
 
 	if !*quiet {
-		fmt.Printf("soak: %s for %s, %d workers x %s per transfer, stall threshold %s\n",
-			*proxyAddr, *duration, *concurrency, humanBytes(int64(size)), *stallAfter)
+		fmt.Printf("soak: %s for %s, %d workers x %s per transfer\n",
+			*proxyAddr, *duration, *concurrency, humanBytes(int64(size)))
+		fmt.Printf("      stall thresholds — download first byte %s, upload total %s\n",
+			th.DownTTFB, th.UpDuration)
 		if len(logs) > 0 {
 			fmt.Printf("      correlating against %d log line(s)\n", len(logs))
 		}
 		fmt.Println()
 	}
+
+	// Heartbeat. A 20-minute run that prints nothing until the end leaves the
+	// person who started it with nothing to look at and no way to tell a slow
+	// run from a hung one. One line per bucket: elapsed, transfers, stalls.
+	stopBeat := make(chan struct{})
+	var beats sync.WaitGroup
+	beats.Add(1)
+	go func() {
+		defer beats.Done()
+		tick := time.NewTicker(*bucketWidth)
+		defer tick.Stop()
+		begin := time.Now()
+		for {
+			select {
+			case <-stopBeat:
+				return
+			case now := <-tick.C:
+				mu.Lock()
+				n, stalls := len(all), 0
+				for _, t := range all {
+					if t.Stalled(th) {
+						stalls++
+					}
+				}
+				mu.Unlock()
+				fmt.Printf("  … %s elapsed, %d transfers, %d stalled, %s moved\n",
+					now.Sub(begin).Round(time.Second), n, stalls,
+					humanBytes(totalBytes.Load()))
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for w := 0; w < *concurrency; w++ {
@@ -168,17 +211,19 @@ func main() {
 					completed.Add(1)
 				}
 
-				if t.Stalled(*stallAfter) && !*quiet {
-					reportStall(t, logs)
+				if t.Stalled(th) && !*quiet {
+					reportStall(t, logs, th)
 				}
 			}
 		}(w)
 	}
 	wg.Wait()
+	close(stopBeat)
+	beats.Wait()
 	end := time.Now()
 
-	s := summarize(all, start, end)
-	buckets := Bucketize(all, start, *bucketWidth)
+	s := summarize(all, start, end, th)
+	buckets := Bucketize(all, start, *bucketWidth, th)
 
 	printSummary(s, buckets, *quiet)
 
@@ -251,14 +296,10 @@ func doTransfer(client *http.Client, worker int, dir string) Transfer {
 // around that moment. Printed live rather than at the end because if the run
 // hangs — which is the symptom — the output so far is all the evidence there
 // will ever be.
-func reportStall(t Transfer, logs []LogEntry) {
-	what := t.Err
-	if what == "" {
-		what = fmt.Sprintf("ttfb %s", t.TTFB.Round(time.Millisecond))
-	}
-	fmt.Printf("STALL  %s  worker %d  %s  %s  (%s, %s)\n",
-		t.Start.Format("15:04:05.000"), t.Worker, t.Dir, what,
-		t.Duration.Round(time.Millisecond), humanBytes(t.Bytes))
+func reportStall(t Transfer, logs []LogEntry, th Thresholds) {
+	fmt.Printf("STALL  %s  worker %d  %s  %s  (%s)\n",
+		t.Start.Format("15:04:05.000"), t.Worker, t.Dir, t.Explain(th),
+		humanBytes(t.Bytes))
 
 	a := Attribute(logs, t.Start, 10*time.Second)
 	for _, l := range a.Lines {
@@ -275,8 +316,9 @@ func printSummary(s Summary, buckets []Bucket, quietMode bool) {
 	fmt.Printf("transfers      %d  (%d failed, %d stalled)\n", s.Transfers, s.Failures, s.Stalls)
 	fmt.Printf("volume         %s in %s\n", humanBytes(s.Bytes), s.Duration.Round(time.Second))
 	fmt.Printf("throughput     %.2f MB/s sustained\n", s.Throughput/(1<<20))
-	fmt.Printf("ttfb           median %s, worst %s\n",
+	fmt.Printf("ttfb (down)    median %s, worst %s\n",
 		s.MedianTTFB.Round(time.Millisecond), s.WorstTTFB.Round(time.Millisecond))
+	fmt.Printf("stalls         %d down, %d up\n", s.StallsDown, s.StallsUp)
 	fmt.Println("─────────────────────────────────────────────")
 
 	if !quietMode && len(buckets) > 0 {
