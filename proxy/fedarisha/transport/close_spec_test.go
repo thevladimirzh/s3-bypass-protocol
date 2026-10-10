@@ -145,7 +145,11 @@ func TestSecondCloseDoesNotBlockOnFirst(t *testing.T) {
 	store := newStallingStore()
 	conn := newCloseTestConn(t, store)
 
-	for i := 0; i < uploadWorkers+70; i++ {
+	// Exactly the pipeline's capacity: one job per worker plus the queue
+	// buffer. Sending more blocks the test goroutine itself inside
+	// sendChunks, which reads like a hang in the code under test but is a
+	// hang in the test.
+	for i := 0; i < uploadWorkers+64; i++ {
 		conn.sendChunks([]pendingChunk{{data: make([]byte, 16), seq: uint64(i)}})
 	}
 	select {
