@@ -220,6 +220,14 @@ func (l *Listener) scanSessionsIn(sessionsDir string) {
 		return // Directory may not exist yet.
 	}
 
+	// Reclaim bookkeeping for directories that are no longer there.
+	//
+	// known and noHelloSince exist only to stop a directory being
+	// re-probed, which is worth nothing once the directory is gone — after
+	// cleanupSession wiped it, or the lifecycle rule swept it. Without this
+	// both maps grew for the life of the process.
+	l.pruneMissing(sessionsDir, dirs)
+
 	for _, d := range dirs {
 		if !d.IsDir {
 			continue
@@ -227,6 +235,42 @@ func (l *Listener) scanSessionsIn(sessionsDir string) {
 		sessDir := sessionsDir + "/" + d.Name
 		l.acceptSession(sessDir)
 	}
+}
+
+// pruneMissing drops entries for directories under sessionsDir that the last
+// listing did not return.
+//
+// Scoped to sessionsDir on purpose: in multi-user mode each user is scanned
+// separately, and one user's scan must never conclude that another user's
+// directory has gone — that would drop live sessions.
+func (l *Listener) pruneMissing(sessionsDir string, dirs []storage.FileInfo) {
+	live := make(map[string]struct{}, len(dirs))
+	for _, d := range dirs {
+		if d.IsDir {
+			live[d.Name] = struct{}{}
+		}
+	}
+	prefix := sessionsDir + "/"
+
+	l.knownMu.Lock()
+	for sessDir := range l.known {
+		if name, ok := strings.CutPrefix(sessDir, prefix); ok {
+			if _, keep := live[name]; !keep {
+				delete(l.known, sessDir)
+			}
+		}
+	}
+	l.knownMu.Unlock()
+
+	l.noHelloMu.Lock()
+	for sessDir := range l.noHelloSince {
+		if name, ok := strings.CutPrefix(sessDir, prefix); ok {
+			if _, keep := live[name]; !keep {
+				delete(l.noHelloSince, sessDir)
+			}
+		}
+	}
+	l.noHelloMu.Unlock()
 }
 
 // acceptSessionFromWebhook handles a webhook notification about a new hello file.
@@ -305,6 +349,7 @@ func (l *Listener) acceptSession(sessDir string) {
 		// and with the server's default 100ms interval a handful of them
 		// saturates the read pool that the next real handshake needs.
 		if l.staleFor(sessDir) {
+			l.forgetNoHello(sessDir)
 			l.knownMu.Lock()
 			l.known[sessDir] = true
 			l.knownMu.Unlock()
