@@ -42,6 +42,12 @@ type Listener struct {
 	known    map[string]bool // key: "sessionsDir/sessID"
 	knownMu  sync.Mutex
 
+	// noHelloSince records when a session directory was first seen without a
+	// hello, so that probing it can be given up on instead of repeated on
+	// every poll tick until the process restarts.
+	noHelloSince map[string]time.Time
+	noHelloMu    sync.Mutex
+
 	closeOnce sync.Once
 	addr      net.Addr
 }
@@ -85,13 +91,14 @@ func Listen(ctx context.Context, store storage.Storage, sessionsDir string, opts
 
 	lCtx, cancel := context.WithCancel(ctx)
 	l := &Listener{
-		Store:       store,
-		SessionsDir: sessionsDir,
-		ctx:         lCtx,
-		cancel:      cancel,
-		incoming:    make(chan *Conn, 16),
-		known:       make(map[string]bool),
-		addr:        fedarishaAddr{tag: "fedarisha-listener:" + sessionsDir},
+		Store:        store,
+		SessionsDir:  sessionsDir,
+		ctx:          lCtx,
+		cancel:       cancel,
+		incoming:     make(chan *Conn, 16),
+		known:        make(map[string]bool),
+		noHelloSince: make(map[string]time.Time),
+		addr:         fedarishaAddr{tag: "fedarisha-listener:" + sessionsDir},
 	}
 	l.applyOpts(opts)
 
@@ -106,14 +113,15 @@ func ListenMultiUser(ctx context.Context, store storage.Storage, sessionsDir str
 	sessionsDir = effectiveSessionsDir(sessionsDir)
 	lCtx, cancel := context.WithCancel(ctx)
 	l := &Listener{
-		Store:       store,
-		SessionsDir: sessionsDir,
-		MultiUser:   true,
-		ctx:         lCtx,
-		cancel:      cancel,
-		incoming:    make(chan *Conn, 16),
-		known:       make(map[string]bool),
-		addr:        fedarishaAddr{tag: "fedarisha-listener:*/" + sessionsDir},
+		Store:        store,
+		SessionsDir:  sessionsDir,
+		MultiUser:    true,
+		ctx:          lCtx,
+		cancel:       cancel,
+		incoming:     make(chan *Conn, 16),
+		known:        make(map[string]bool),
+		noHelloSince: make(map[string]time.Time),
+		addr:         fedarishaAddr{tag: "fedarisha-listener:*/" + sessionsDir},
 	}
 	l.applyOpts(opts)
 
@@ -228,6 +236,29 @@ func (l *Listener) acceptSessionFromWebhook(sessDir string) {
 	l.acceptSession(sessDir)
 }
 
+// staleFor reports whether a session directory has gone long enough without a
+// hello that the listener should stop waiting for one. The first miss only
+// starts the clock; it never retires a directory on its own, because the
+// server can see the directory before the client's hello lands.
+func (l *Listener) staleFor(sessDir string) bool {
+	l.noHelloMu.Lock()
+	first, seen := l.noHelloSince[sessDir]
+	if !seen {
+		l.noHelloSince[sessDir] = time.Now()
+		l.noHelloMu.Unlock()
+		return false
+	}
+	l.noHelloMu.Unlock()
+
+	return time.Since(first) > staleSessionProbeWindow
+}
+
+func (l *Listener) forgetNoHello(sessDir string) {
+	l.noHelloMu.Lock()
+	delete(l.noHelloSince, sessDir)
+	l.noHelloMu.Unlock()
+}
+
 // acceptSession performs the key exchange handshake for a single session directory
 // and enqueues the resulting connection.
 func (l *Listener) acceptSession(sessDir string) {
@@ -268,8 +299,20 @@ func (l *Listener) acceptSession(sessDir string) {
 	helloPath := sessDir + "/" + HelloFile
 	data, err := l.Store.Download(l.ctx, helloPath)
 	if err != nil || len(data) == 0 {
-		return // Not ready yet.
+		// No hello yet. This is normal for the first moments of a connection,
+		// but it is not a state worth re-probing forever: an abandoned
+		// directory used to cost one guaranteed-404 GET on every poll tick,
+		// and with the server's default 100ms interval a handful of them
+		// saturates the read pool that the next real handshake needs.
+		if l.staleFor(sessDir) {
+			l.knownMu.Lock()
+			l.known[sessDir] = true
+			l.knownMu.Unlock()
+		}
+		return
 	}
+
+	l.forgetNoHello(sessDir)
 
 	// Extract client public key from hello (after sessID).
 	if len(data) < len(sessID)+32 {
