@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,39 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 )
+
+// webhookClientTimeout bounds the notification-configuration call.
+//
+// It is generous because the operation is not hot: one call per inbound, at
+// startup. It exists at all because this call runs synchronously during inbound
+// init, before the listener starts, so an object store that accepts the
+// connection and then stops responding would otherwise leave the inbound down
+// permanently with nothing logged.
+const webhookClientTimeout = 30 * time.Second
+
+// webhookHTTPClient returns the client used for the notification call.
+//
+// Not http.DefaultClient: that one has no timeout, it is process-global, and
+// borrowing it means anything else in the program can change our timeout or
+// inherit ours. ResponseHeaderTimeout is set as well as the overall deadline,
+// because the failure this guards against is precisely a server that completes
+// the handshake and then goes quiet — which an overall deadline covers, but one
+// that reads as a timeout rather than as a mystery.
+func webhookHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: webhookClientTimeout,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ResponseHeaderTimeout: webhookClientTimeout,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+		},
+	}
+}
 
 // SetupWebhook configures S3 bucket notification to send ObjectCreated events
 // to the given webhook URL. This uses the VK Cloud S3 SimpleTopicConfiguration
@@ -79,7 +113,7 @@ func (s *S3Store) SetupWebhook(ctx context.Context, webhookURL, prefix string) e
 		return fmt.Errorf("sign request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := webhookHTTPClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
