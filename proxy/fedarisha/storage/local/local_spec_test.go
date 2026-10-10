@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,18 +52,38 @@ func TestUploadedObjectIsNeverPartiallyVisible(t *testing.T) {
 	}
 
 	// Overwriting must replace the object, not truncate it in place. The
-	// distinction is the inode: os.WriteFile reuses the existing one and
-	// truncates it, so a concurrent List-then-GET reader can observe the
-	// object at some intermediate size. Writing to a temporary file and
-	// renaming gives it a new one, and a reader sees either the whole old
+	// distinction is the file's identity: os.WriteFile reuses the existing
+	// inode and truncates it, so a concurrent List-then-GET reader can observe
+	// the object at some intermediate size. Writing to a temporary file and
+	// renaming gives it a new identity, and a reader sees either the whole old
 	// object or the whole new one.
 	//
-	// Asserted through the inode rather than by sampling sizes, because
-	// sampling missed the window even at 32MB — the truncation is real but
-	// far shorter than the poll loop can reliably catch.
+	// Asserted through os.SameFile rather than by sampling sizes, because
+	// sampling missed the window even at 32MB — the truncation is real but far
+	// shorter than a poll loop can reliably catch.
+	if runtime.GOOS == "windows" {
+		// Go's Windows implementation of SameFile falls back to comparing path
+		// strings when the file ID cannot be read, and then reports "same file"
+		// for any two stats of the same path — including one taken before a
+		// rename replaced it. The assertion cannot distinguish the two
+		// implementations, so it is skipped rather than quietly inverted.
+		t.Skip("os.SameFile cannot observe replacement on Windows")
+	}
 	if os.SameFile(before, after) {
 		t.Error("the object was truncated in place rather than replaced; " +
 			"a concurrent reader can observe a partially written object")
+	}
+
+	// Portable companion: whatever the platform, an upload must not leave its
+	// scratch file behind.
+	entries, err := os.ReadDir(filepath.Dir(objectPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), uploadTempPrefix) {
+			t.Errorf("upload left %q behind", e.Name())
+		}
 	}
 
 	got, err := store.Download(context.Background(), path)
