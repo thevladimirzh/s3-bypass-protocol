@@ -59,6 +59,16 @@ type ListenOpts struct {
 
 const DefaultSessionsDir = "sessions"
 
+// staleSessionProbeWindow is how long a session directory that has never shown
+// a hello keeps being probed before the listener gives up on it.
+//
+// A directory with no hello is normal for the first moments of a connection —
+// the client creates it and writes the hello a moment later — so this has to be
+// comfortably longer than that. It also has to be short enough that a client
+// which died mid-handshake stops costing requests within a minute, because
+// until it does, every poll tick re-reads a file that can only answer 404.
+var staleSessionProbeWindow = 60 * time.Second
+
 func effectiveSessionsDir(dir string) string {
 	if strings.TrimSpace(dir) == "" {
 		return DefaultSessionsDir
