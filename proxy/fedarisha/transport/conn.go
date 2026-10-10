@@ -277,6 +277,10 @@ const (
 	// sessions before anything queues.
 	maxWriteConcurrency = 16
 
+	// maxDeleteConcurrency caps DELETEs in flight for consumed files. Added for
+	// M6; not yet wired in, so the specs compile against it.
+	maxDeleteConcurrency = 8
+
 	// writePoolConnections mirrors the write pool the S3 backend opens (48 in
 	// storage/s3).
 	writePoolConnections = 48
