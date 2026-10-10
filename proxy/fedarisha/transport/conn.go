@@ -159,11 +159,11 @@ const uploadWorkers = 32
 // (on a marginal uplink every PUT then trips the hedge, doubling traffic and
 // spiralling goodput toward zero). So a large file only gets a duplicate once
 // it's clearly stuck, past uploadHedgeLarge.
-const (
+var (
 	uploadHedgeSmall   = 600 * time.Millisecond
 	uploadHedgeLarge   = 3 * time.Second
 	uploadHedgeSizeCut = 256 * 1024 // bytes; files at/above use the large delay
-	uploadTimeout      = 8 * time.Second
+	uploadTimeout      = 8 * time.Second // overridden in tests
 	uploadAttempts     = 3
 
 	// Retry pacing for uploadUntilDelivered. The retries above are hedged
@@ -209,7 +209,7 @@ const (
 // still in flight (beta observation 2026-10-09 — the teardown, not the producer,
 // was the outage). 25s outlives the full upload budget with room to spare, and
 // still recovers in a fraction of the keepalive window.
-const holeTimeout = 25 * time.Second
+var holeTimeout = 25 * time.Second // overridden in tests
 
 // Hedged GETs. A healthy GET returns in a few hundred ms; a tail (a transient
 // error pushed the AWS SDK into a multi-second backoff-retry, or a connection
