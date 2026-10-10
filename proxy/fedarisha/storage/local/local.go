@@ -13,6 +13,11 @@ import (
 	"github.com/xtls/xray-core/proxy/fedarisha/storage"
 )
 
+// uploadTempPrefix marks a file that is being written and is not yet an
+// object. Chosen so it cannot collide with a session file: real objects are
+// named s_%08x / c_%08x.
+const uploadTempPrefix = ".upload-"
+
 type Config struct {
 	RootDir string `json:"root_dir"`
 }
@@ -30,23 +35,74 @@ func (l *Local) Init(_ context.Context) error {
 }
 
 func (l *Local) EnsureDir(_ context.Context, path string) error {
-	return os.MkdirAll(l.abs(path), 0o755)
+	fp, err := l.abs(path)
+	if err != nil {
+		return err
+	}
+	return os.MkdirAll(fp, 0o755)
 }
 
+// Upload writes the object through a temporary file and renames it into place.
+//
+// Writing in place would truncate first and write second, and the protocol's
+// reader is List-then-GET with no size check — so it could read a half-written
+// object, exactly as it cannot against S3, where an object appears only once
+// its body is complete. Rename is atomic on POSIX and on Windows, so a reader
+// sees either the whole previous object or the whole new one.
+//
+// The temporary name includes a suffix that cannot collide with a real object,
+// because a stray temp file appearing in a listing would be handed to the peer
+// as if it were session data.
 func (l *Local) Upload(_ context.Context, path string, data []byte) error {
-	fp := l.abs(path)
+	fp, err := l.abs(path)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(fp, data, 0o644)
+
+	tmp, err := os.CreateTemp(filepath.Dir(fp), ".upload-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Best effort: the rename has already consumed it on success.
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, fp)
 }
 
 func (l *Local) Download(_ context.Context, path string) ([]byte, error) {
-	return os.ReadFile(l.abs(path))
+	fp, err := l.abs(path)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(fp)
 }
 
 func (l *Local) List(_ context.Context, dir string, prefix string) ([]storage.FileInfo, error) {
-	entries, err := os.ReadDir(l.abs(dir))
+	dirPath, err := l.abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -55,6 +111,11 @@ func (l *Local) List(_ context.Context, dir string, prefix string) ([]storage.Fi
 	}
 	var result []storage.FileInfo
 	for _, e := range entries {
+		// A partially written upload is not an object yet. S3 never lists one,
+		// so listing one here would hand the peer a file that is not there.
+		if strings.HasPrefix(e.Name(), uploadTempPrefix) {
+			continue
+		}
 		if prefix != "" && !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
@@ -75,11 +136,15 @@ func (l *Local) List(_ context.Context, dir string, prefix string) ([]storage.Fi
 }
 
 func (l *Local) Delete(_ context.Context, path string) error {
-	err := os.Remove(l.abs(path))
-	if os.IsNotExist(err) {
-		return nil
+	fp, err := l.abs(path)
+	if err != nil {
+		return err
 	}
-	return err
+	if err := os.Remove(fp); os.IsNotExist(err) {
+		return nil
+	} else {
+		return err
+	}
 }
 
 func (l *Local) Watch(ctx context.Context, dir string, since time.Time, timeout time.Duration) ([]storage.FileInfo, error) {
@@ -107,20 +172,33 @@ func (l *Local) Watch(ctx context.Context, dir string, since time.Time, timeout 
 	return nil, nil
 }
 
-func (l *Local) abs(rel string) string {
+// abs resolves a storage-relative path and refuses anything that escapes the
+// root.
+//
+// The containment test requires a separator after the root, not merely the
+// root as a string prefix: "/var/fed" is a prefix of "/var/fed-backup", so a
+// sibling directory with a common name would otherwise pass.
+//
+// A refusal is an error rather than a panic. Every method routes through here,
+// so panicking took the process down on the caller's goroutine instead of
+// surfacing where it could be logged and handled.
+func (l *Local) abs(rel string) (string, error) {
 	rel = strings.TrimPrefix(rel, "/")
 	if rel == "" {
-		return l.root
+		return l.root, nil
 	}
 	fp := filepath.Join(l.root, filepath.FromSlash(rel))
-	// Safety: prevent path traversal.
+
 	abs, err := filepath.Abs(fp)
 	if err != nil {
-		return fp
+		return "", fmt.Errorf("resolve %s: %w", rel, err)
 	}
-	rootAbs, _ := filepath.Abs(l.root)
-	if !strings.HasPrefix(abs, rootAbs) {
-		panic(fmt.Sprintf("path traversal attempt: %s", rel))
+	rootAbs, err := filepath.Abs(l.root)
+	if err != nil {
+		return "", fmt.Errorf("resolve root: %w", err)
 	}
-	return abs
+	if abs != rootAbs && !strings.HasPrefix(abs, rootAbs+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes the storage root", rel)
+	}
+	return abs, nil
 }
