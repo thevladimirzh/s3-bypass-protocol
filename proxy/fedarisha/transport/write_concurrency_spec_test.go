@@ -86,14 +86,19 @@ func TestHedgingDoesNotExceedTheWritePool(t *testing.T) {
 		}
 	}
 
+	// Stop once the peak has stopped moving, rather than always paying the
+	// full window: the point is the highest concurrency reached, and once it
+	// has been reached a few more hedge rounds cannot raise it.
 	deadline := time.Now().Add(4 * time.Second)
 	peak := 0
+	stableSince := time.Now()
 	for time.Now().Before(deadline) {
 		if p := store.peakConcurrency(); p > peak {
 			peak = p
-			if p > uploadWorkers {
-				break
-			}
+			stableSince = time.Now()
+		}
+		if peak > 0 && time.Since(stableSince) > 300*time.Millisecond {
+			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

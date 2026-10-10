@@ -104,7 +104,21 @@ type Conn struct {
 	// has to be enforced per ATTEMPT, not per file: a hedged read fires a second
 	// request, so a per-file limit let twice maxReadConcurrency requests reach the
 	// backend at once — which is how the original 48 became a 48-connection burst.
+	// readSem bounds read GETs that are actually in flight on the wire. The cap
+	// lives here rather than on the storage backend because one storage object
+	// is shared by every session on the connection: the point is that one
+	// session cannot spend the whole pool, not that the pool is a global limit.
+	// Taken per attempt inside downloadWithTimeout rather than per file, so a
+	// hedged request cannot double the number of GETs on the wire.
 	readSem chan struct{}
+
+	// writeSem bounds PUTs actually in flight on the wire, taken per request
+	// inside uploadWithTimeout. Without it, hedging multiplies each file into
+	// uploadAttempts copies across uploadWorkers workers and the connection
+	// reaches 96 concurrent PUTs against a write pool of 48 — and the surplus
+	// waits in the transport's dial queue, charged against the upload budget,
+	// which trips the hedge timer and queues more.
+	writeSem chan struct{}
 
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -194,6 +208,25 @@ const (
 	// fetch round cannot saturate the pool the DELETEs of consumed files also
 	// need.
 	readPoolConnections = 96
+
+	// maxWriteConcurrency caps concurrent PUTs a single connection may have in
+	// flight, taken per request rather than per hedged file.
+	//
+	// Without it, hedging multiplies each file into uploadAttempts copies
+	// across uploadWorkers workers — 96 against a write pool of 48 — and the
+	// surplus does not fail, it waits in the transport's dial queue. That
+	// waiting is charged against the upload budget, so a queued PUT trips the
+	// hedge timer, which queues more. The hedge degenerates into "triplicate
+	// every PUT" exactly when the pool is under pressure.
+	//
+	// It mirrors readSem, which exists for the same reason on the read side.
+	// 16 leaves three connections' worth of the 48-connection pool for other
+	// sessions before anything queues.
+	maxWriteConcurrency = 16
+
+	// writePoolConnections mirrors the write pool the S3 backend opens (48 in
+	// storage/s3).
+	writePoolConnections = 48
 )
 
 // holeTimeout bounds how long a missing readSeq file (with later files already
@@ -322,6 +355,7 @@ func NewConn(cfg ConnConfig) *Conn {
 		userPrefix:    cfg.UserPrefix,
 		inboundTag:    cfg.InboundTag,
 		readSem:       make(chan struct{}, maxReadConcurrency),
+		writeSem:      make(chan struct{}, maxWriteConcurrency),
 	}
 	c.readCond = sync.NewCond(&c.readMu)
 
@@ -652,6 +686,20 @@ func (c *Conn) uploadWithTimeout(path string, data []byte) error {
 
 	errCh := make(chan error, uploadAttempts)
 	put := func() {
+		// Taken per request, not per file: a hedged file is several Upload calls
+		// and each has to hold a permit of its own, otherwise hedging is exactly
+		// what multiplies the connection's request count past the pool.
+		select {
+		case c.writeSem <- struct{}{}:
+		case <-ctx.Done():
+			select {
+			case errCh <- ctx.Err():
+			default:
+			}
+			return
+		}
+		defer func() { <-c.writeSem }()
+
 		select {
 		case errCh <- c.store.Upload(ctx, path, data):
 		case <-ctx.Done():
