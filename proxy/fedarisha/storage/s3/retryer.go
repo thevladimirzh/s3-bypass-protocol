@@ -4,8 +4,8 @@ import (
 	"math"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 )
 
 // newStoreRetryer returns the retry policy for object-store calls, which is
