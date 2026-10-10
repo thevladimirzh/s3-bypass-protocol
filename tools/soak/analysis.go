@@ -134,14 +134,29 @@ type Summary struct {
 	Stalls     int           `json:"stalls"`
 	StallsDown int           `json:"stallsDown"`
 	StallsUp   int           `json:"stallsUp"`
-	WorstTTFB  time.Duration `json:"worstTTFB"`
-	MedianTTFB time.Duration `json:"medianTTFB"`
-	Throughput float64       `json:"throughput"` // bytes/sec across the whole run
+
+	// Download and upload statistics are kept apart and named for their
+	// direction. An upload records a TTFB too — the moment response headers
+	// land — but that number includes sending the body, so mixing it with
+	// downloads produces a "worst first byte" that belongs to neither. That
+	// mislabelled figure is exactly the kind of thing that sends someone
+	// chasing a latency problem that is really a bandwidth one.
+	DownCount      int           `json:"downCount"`
+	DownMedianTTFB time.Duration `json:"downMedianTTFB"`
+	DownWorstTTFB  time.Duration `json:"downWorstTTFB"`
+	DownP90TTFB    time.Duration `json:"downP90TTFB"`
+	UpCount        int           `json:"upCount"`
+	UpMedianDur    time.Duration `json:"upMedianDuration"`
+	UpWorstDur     time.Duration `json:"upWorstDuration"`
+
+	Throughput float64 `json:"throughput"` // bytes/sec across the whole run
 }
 
 func summarize(transfers []Transfer, start, end time.Time, th Thresholds) Summary {
 	s := Summary{Started: start, Duration: end.Sub(start)}
-	ttfbs := make([]time.Duration, 0, len(transfers))
+
+	var downTTFB, upDur []time.Duration
+
 	for _, t := range transfers {
 		s.Transfers++
 		s.Bytes += t.Bytes
@@ -156,21 +171,62 @@ func summarize(transfers []Transfer, start, end time.Time, th Thresholds) Summar
 				s.StallsDown++
 			}
 		}
-		if t.TTFB > s.WorstTTFB {
-			s.WorstTTFB = t.TTFB
+
+		// Failed transfers are excluded: a timeout contributes a number that
+		// says nothing about how fast the tunnel is, and letting them into a
+		// median drags it toward the ceiling for no reason.
+		if t.Err != "" {
+			continue
 		}
-		if t.Err == "" {
-			ttfbs = append(ttfbs, t.TTFB)
+		if t.Dir == "up" {
+			upDur = append(upDur, t.Duration)
+		} else {
+			downTTFB = append(downTTFB, t.TTFB)
 		}
 	}
-	sort.Slice(ttfbs, func(i, j int) bool { return ttfbs[i] < ttfbs[j] })
-	if len(ttfbs) > 0 {
-		s.MedianTTFB = ttfbs[len(ttfbs)/2]
-	}
+
+	s.DownCount = len(downTTFB)
+	sortDurations(downTTFB)
+	s.DownWorstTTFB = lastOrZero(downTTFB)
+	s.DownMedianTTFB = medianOf(downTTFB)
+	s.DownP90TTFB = percentileOf(downTTFB, 0.90)
+
+	s.UpCount = len(upDur)
+	sortDurations(upDur)
+	s.UpWorstDur = lastOrZero(upDur)
+	s.UpMedianDur = medianOf(upDur)
+
 	if el := s.Duration.Seconds(); el > 0 {
 		s.Throughput = float64(s.Bytes) / el
 	}
 	return s
+}
+
+func sortDurations(d []time.Duration) { sort.Slice(d, func(i, j int) bool { return d[i] < d[j] }) }
+
+func lastOrZero(d []time.Duration) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	return d[len(d)-1]
+}
+
+func medianOf(sorted []time.Duration) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[len(sorted)/2]
+}
+
+func percentileOf(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	i := int(float64(len(sorted)) * p)
+	if i >= len(sorted) {
+		i = len(sorted) - 1
+	}
+	return sorted[i]
 }
 
 // --- log correlation ---------------------------------------------------------

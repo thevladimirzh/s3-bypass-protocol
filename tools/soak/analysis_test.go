@@ -102,34 +102,48 @@ func TestBucketizeSeparatesTransfersInTime(t *testing.T) {
 	}
 }
 
-func TestSummarizeCountsStallsFailuresAndBytes(t *testing.T) {
+func TestSummarizeKeepsTheTwoDirectionsApart(t *testing.T) {
 	start := time.Now()
 	ts := []Transfer{
 		{Dir: "down", Start: start, TTFB: 10 * time.Millisecond, Bytes: 1000, Duration: time.Second},
 		{Dir: "down", Start: start, TTFB: 20 * time.Millisecond, Bytes: 2000, Duration: time.Second},
 		{Dir: "down", Start: start, TTFB: 30 * time.Second, Bytes: 500, Duration: 31 * time.Second},
 		{Dir: "down", Start: start, TTFB: 0, Bytes: 0, Err: "connection reset"},
+		// An upload records a TTFB as well, and it is a completely different
+		// quantity: response headers cannot arrive until the body has been
+		// sent, so this one is the transfer duration.
+		{Dir: "up", Start: start, TTFB: 40 * time.Second, Duration: 40 * time.Second, Bytes: 0},
 	}
 	s := summarize(ts, start, start.Add(10*time.Second), testThresholds)
 
-	if s.Transfers != 4 {
-		t.Fatalf("transfers = %d, want 4", s.Transfers)
+	if s.Transfers != 5 {
+		t.Fatalf("transfers = %d, want 5", s.Transfers)
 	}
 	if s.Failures != 1 {
 		t.Fatalf("failures = %d, want 1", s.Failures)
 	}
-	if s.Stalls != 2 {
-		t.Fatalf("stalls = %d, want 2 (the late one and the failure)", s.Stalls)
+	// 30s download, the failed download, and the 40s upload are all stalls.
+	if s.Stalls != 3 || s.StallsDown != 2 || s.StallsUp != 1 {
+		t.Fatalf("stalls = %d (down %d, up %d), want 3 / 2 / 1", s.Stalls, s.StallsDown, s.StallsUp)
 	}
 	if s.Bytes != 3500 {
 		t.Fatalf("bytes = %d, want 3500", s.Bytes)
 	}
-	if s.WorstTTFB != 30*time.Second {
-		t.Fatalf("worst ttfb = %v, want 30s", s.WorstTTFB)
+
+	// The regression this pins: an upload's 40s TTFB must NOT become the
+	// headline "worst first byte". That figure is what a reader trusts when
+	// judging download latency, and it belongs to the wrong direction.
+	if s.DownWorstTTFB != 30*time.Second {
+		t.Fatalf("worst DOWNLOAD first byte = %v, want 30s", s.DownWorstTTFB)
 	}
-	// Median over the three that succeeded.
-	if s.MedianTTFB != 20*time.Millisecond {
-		t.Fatalf("median ttfb = %v, want 20ms (failures must not drag it to zero)", s.MedianTTFB)
+	if s.DownCount != 3 {
+		t.Fatalf("down count = %d, want 3 (failures excluded)", s.DownCount)
+	}
+	if s.DownMedianTTFB != 20*time.Millisecond {
+		t.Fatalf("median download first byte = %v, want 20ms", s.DownMedianTTFB)
+	}
+	if s.UpCount != 1 || s.UpWorstDur != 40*time.Second {
+		t.Fatalf("upload stats = %d / %v, want 1 / 40s", s.UpCount, s.UpWorstDur)
 	}
 }
 

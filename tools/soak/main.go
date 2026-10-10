@@ -316,9 +316,12 @@ func printSummary(s Summary, buckets []Bucket, quietMode bool) {
 	fmt.Printf("transfers      %d  (%d failed, %d stalled)\n", s.Transfers, s.Failures, s.Stalls)
 	fmt.Printf("volume         %s in %s\n", humanBytes(s.Bytes), s.Duration.Round(time.Second))
 	fmt.Printf("throughput     %.2f MB/s sustained\n", s.Throughput/(1<<20))
-	fmt.Printf("ttfb (down)    median %s, worst %s\n",
-		s.MedianTTFB.Round(time.Millisecond), s.WorstTTFB.Round(time.Millisecond))
-	fmt.Printf("stalls         %d down, %d up\n", s.StallsDown, s.StallsUp)
+	fmt.Printf("download        %d transfers, first byte p50 %s  p90 %s  worst %s\n",
+		s.DownCount, s.DownMedianTTFB.Round(time.Millisecond),
+		s.DownP90TTFB.Round(time.Millisecond), s.DownWorstTTFB.Round(time.Millisecond))
+	fmt.Printf("upload          %d transfers, total p50 %s  worst %s\n",
+		s.UpCount, s.UpMedianDur.Round(time.Millisecond), s.UpWorstDur.Round(time.Millisecond))
+	fmt.Printf("stalls          %d down (first byte), %d up (total duration)\n", s.StallsDown, s.StallsUp)
 	fmt.Println("─────────────────────────────────────────────")
 
 	if !quietMode && len(buckets) > 0 {
