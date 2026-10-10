@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -213,6 +214,40 @@ func TestConsumedFilesDoNotFloodTheBackendWithDeletes(t *testing.T) {
 	}
 	if got := store.deleteCount(); got == 0 {
 		t.Fatalf("no Delete was issued at all; the cap must bound concurrency, not suppress cleanup")
+	}
+}
+
+// Spec: when the queue does fill, the shed has to be reported rather than
+// absorbed. Dropping is safe because cleanupSession sweeps at Close, but that
+// is a design argument, and an unreported shed is indistinguishable from the
+// deletion having happened. The reader must be unaffected either way — it never
+// waits on housekeeping.
+func TestShedDeletesAreReportedAndDoNotStallTheReader(t *testing.T) {
+	inner := newFakeStore()
+	release := make(chan struct{})
+	defer close(release)
+	store := &deleteTrackingStore{Storage: inner, block: release}
+
+	var out syncBuffer
+	restore := captureLog(&out)
+	defer restore()
+
+	sessDir := "sessions/delete-shed"
+	c := NewConn(ConnConfig{Store: store, SessionDir: sessDir, SessionID: GenerateSessionID()})
+	defer c.Close()
+
+	// Enough files that several rounds are consumed while the workers stay
+	// blocked, so the queue is forced past its depth.
+	const files = deleteQueueDepth + maxReadBatch*2
+	plantSeqs(t, c, inner, sessDir, files)
+
+	want := files * len("payload")
+	if got := readAtLeast(c, want, 120*time.Second); got != want {
+		t.Fatalf("shedding deletes cost the reader its data: got %d of %d bytes", got, want)
+	}
+
+	if !waitFor(func() bool { return strings.Contains(out.String(), "delete queue full") }, 15*time.Second) {
+		t.Fatalf("a shed housekeeping delete must be reported; got: %s", out.String())
 	}
 }
 

@@ -66,12 +66,28 @@ type Conn struct {
 	// Active transfer tracking — suppress backoff when data is flowing.
 	lastRecvActive atomic.Int64 // unix nano of last successful fetch
 
-	// listErrLastLog is the unix nano of the last reported List failure; zero
-	// means none has been reported yet. Polls run every 90ms when a session is
-	// active, so an unthrottled error line is a flood that costs more than it
-	// explains. Atomic because fetchNext is reachable from outside the poll
-	// loop as well, so two reporters cannot tear the struct.
-	listErrLastLog atomic.Int64
+	// Consumed files are removed as they are read so a long session does not
+	// leave thousands of objects behind for cleanupSession to sweep. That work
+	// used to be one detached goroutine per file with no ceiling, so a fast
+	// download issued DELETEs faster than the backend retired them. It runs
+	// through a fixed pool and a bounded queue instead.
+	//
+	// deleteQueue is deliberately non-blocking on the send side. The reader is
+	// the latency path and must not queue behind housekeeping; when the queue
+	// is full the delete is dropped, because cleanupSession is the authoritative
+	// sweep at Close and will pick the object up regardless.
+	deleteQueue chan string
+	deleteWg    sync.WaitGroup
+
+	// deleteDrops counts housekeeping deletes dropped to a full queue.
+	deleteDrops atomic.Int64
+
+	// Throttled diagnostics. Each kind is reported once and then paced, so a
+	// persistently failing backend costs one line per interval rather than one
+	// per poll.
+	listDiag   throttledLogger
+	deleteDiag throttledLogger
+	dropDiag   throttledLogger
 
 	lastFlush time.Time // time of last actual flush
 
@@ -221,6 +237,29 @@ func currentListTimeout() time.Duration {
 // outage into a log flood.
 const listErrLogInterval = 30 * time.Second
 
+// throttledLogger reports the first event it is handed and then at most one per
+// interval. The poll loop runs every 90ms and a backend can fail every one of
+// those, so an unthrottled line is a flood that costs more than it explains —
+// but the first must never be dropped, because "the backend is failing" and
+// "the backend failed once" are very different things to read at 3am.
+type throttledLogger struct {
+	mu   sync.Mutex
+	seen bool
+	last time.Time
+}
+
+// allow reports whether the event happening at now is worth a line, and records
+// it either way so the next call is paced from here.
+func (t *throttledLogger) allow(now time.Time, interval time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.seen && now.Sub(t.last) < interval {
+		return false
+	}
+	t.seen, t.last = true, now
+	return true
+}
+
 // noteListFailure reports a failed List.
 //
 // The error was previously dropped with a comment calling it transient. It is
@@ -228,16 +267,68 @@ const listErrLogInterval = 30 * time.Second
 // diagnosis: a permanent failure (denied ListBucket on restricted credentials,
 // a bucket that no longer exists) looks identical from inside the loop and was
 // retried in silence until the session was written off as broken.
-//
-// Two callers racing through the interval check costs one extra log line. That
-// is the right trade against a lock on the poll loop's hot path.
 func (c *Conn) noteListFailure(err error) {
-	now := time.Now()
-	if last := c.listErrLastLog.Load(); last != 0 && now.Sub(time.Unix(0, last)) < listErrLogInterval {
+	if !c.listDiag.allow(time.Now(), listErrLogInterval) {
 		return
 	}
-	c.listErrLastLog.Store(now.UnixNano())
 	log.Printf("[fedarisha:%s] read list failed (retrying): %v", shortID(c.sessionID), err)
+}
+
+// noteDeleteFailure reports a consumed file that could not be removed. Swallowed,
+// this is how objects accumulate with no trace: a denied DeleteObject or a
+// sustained SlowDown leaves the object for cleanupSession to find at Close,
+// hours later, or never.
+func (c *Conn) noteDeleteFailure(path string, err error) {
+	if !c.deleteDiag.allow(time.Now(), deleteErrLogInterval) {
+		return
+	}
+	log.Printf("[fedarisha:%s] delete of %s failed: %v", shortID(c.sessionID), path, err)
+}
+
+// noteDeleteDrop records a housekeeping delete shed to a full queue. Dropping is
+// safe by construction — cleanupSession sweeps the session at Close — but it is
+// still a deliberate loss and has to be visible, not absorbed into silence.
+func (c *Conn) noteDeleteDrop() {
+	n := c.deleteDrops.Add(1)
+	if !c.dropDiag.allow(time.Now(), deleteDropLogInterval) {
+		return
+	}
+	log.Printf("[fedarisha:%s] delete queue full, %d housekeeping delete(s) shed so far; "+
+		"cleanupSession will sweep them at close", shortID(c.sessionID), n)
+}
+
+// deleteFile schedules removal of a consumed object. It never blocks: the read
+// path is the latency path, and queueing it behind housekeeping would trade one
+// kind of slowness for a worse one. A shed delete is recovered at Close.
+func (c *Conn) deleteFile(path string) {
+	select {
+	case c.deleteQueue <- path:
+	default:
+		c.noteDeleteDrop()
+	}
+}
+
+// deleteWorker drains the housekeeping queue. It exits on the cancelled context
+// so Close stays non-blocking; any delete already in flight finishes on its own
+// context, and anything still queued is picked up by cleanupSession.
+func (c *Conn) deleteWorker() {
+	defer c.deleteWg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case path := <-c.deleteQueue:
+			// Background-derived on purpose: Close cancels c.ctx, and a delete
+			// cut short by its own teardown is the object we were trying to
+			// remove in the first place.
+			dctx, cancel := context.WithTimeout(context.Background(), deleteCallTimeout)
+			err := c.store.Delete(dctx, path)
+			cancel()
+			if err != nil {
+				c.noteDeleteFailure(path, err)
+			}
+		}
+	}
 }
 
 // Read batching bounds. Each poll Lists the session dir (cheap, strongly
@@ -247,6 +338,36 @@ func (c *Conn) noteListFailure(err error) {
 // of the read S3 pool used so it can't starve unrelated work.
 const (
 	maxReadBatch = 64
+
+	// maxDeleteConcurrency caps DELETEs in flight for consumed files. Those
+	// deletes used to be one detached goroutine per file with no ceiling, so a
+	// fast download issued them faster than the backend retired them — 31 at
+	// once in the spec, against a read pool the transfer itself is using.
+	// Housekeeping must not compete with the transfer it is tidying up after.
+	maxDeleteConcurrency = 8
+
+	// deleteQueueDepth is how many pending housekeeping deletes may wait behind
+	// the workers. Sized well above the cap so a burst is absorbed rather than
+	// dropped, but bounded so a long session cannot accumulate an unbounded
+	// backlog of live work.
+	deleteQueueDepth = 256
+
+	// deleteCallTimeout bounds one Delete. Generous on purpose: this runs after
+	// the bytes are already delivered, so a merely slow backend should not cut
+	// the call short.
+	deleteCallTimeout = 10 * time.Second
+
+	// cleanupListAttempts and cleanupRetryDelay keep one SlowDown at teardown
+	// from costing the whole session. cleanupSession sweeps the hundreds-to-
+	// thousands of objects a long session accumulates, and used to keep none
+	// of them after a single failed call.
+	cleanupListAttempts = 3
+	cleanupRetryDelay   = 500 * time.Millisecond
+
+	// Diagnostics pacing on the delete path. A persistently failing backend
+	// costs one line per interval, not one line per file.
+	deleteErrLogInterval  = 30 * time.Second
+	deleteDropLogInterval = 5 * time.Second
 	// Read GETs in flight cap. This used to be 48, which is most of the read pool
 	// and was itself the cause of the stall: a parallel-download burst drove the
 	// backend's tail latency up until responses no longer fit the GET budget, and
@@ -276,10 +397,6 @@ const (
 	// 16 leaves three connections' worth of the 48-connection pool for other
 	// sessions before anything queues.
 	maxWriteConcurrency = 16
-
-	// maxDeleteConcurrency caps DELETEs in flight for consumed files. Added for
-	// M6; not yet wired in, so the specs compile against it.
-	maxDeleteConcurrency = 8
 
 	// writePoolConnections mirrors the write pool the S3 backend opens (48 in
 	// storage/s3).
@@ -413,8 +530,17 @@ func NewConn(cfg ConnConfig) *Conn {
 		inboundTag:    cfg.InboundTag,
 		readSem:       make(chan struct{}, maxReadConcurrency),
 		writeSem:      make(chan struct{}, maxWriteConcurrency),
+		deleteQueue:   make(chan string, deleteQueueDepth),
 	}
 	c.readCond = sync.NewCond(&c.readMu)
+
+	// Housekeeping deletes run on their own pool. Started here rather than
+	// per file so the ceiling is a property of the connection rather than
+	// something the download rate decides.
+	for i := 0; i < maxDeleteConcurrency; i++ {
+		c.deleteWg.Add(1)
+		go c.deleteWorker()
+	}
 
 	// Register with webhook hub if available.
 	if cfg.WebhookHub != nil {
@@ -1172,13 +1298,12 @@ func (c *Conn) fetchNext() int {
 		c.readSeqSnapshot.Store(c.readSeq)
 		consumed++
 
-		// Detached delete (robust against a Close race cancelling c.ctx).
-		path := c.sessDir + "/" + SeqFileName(c.readPrefix, seq)
-		go func(p string) {
-			dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = c.store.Delete(dctx, p)
-		}(path)
+		// Housekeeping removal of the object we just consumed. Scheduled, not
+		// awaited: the bytes are already delivered to the reader, so waiting on
+		// a DELETE here would put the backend's latency on the latency path.
+		// The pool bounds how many are in flight, and cleanupSession is the
+		// authoritative sweep if one is shed.
+		c.deleteFile(c.sessDir + "/" + SeqFileName(c.readPrefix, seq))
 	}
 
 	// Anything fetched this round but past the consume point: cache it so the
@@ -1353,9 +1478,44 @@ type batchDeleter interface {
 	BatchDelete(ctx context.Context, paths []string) error
 }
 
+// listForCleanup re-lists the session while the teardown budget lasts.
+//
+// A single failed call used to end cleanupSession outright, which cost the
+// entire session: this runs over the hundreds-to-thousands of objects a long
+// session accumulates, so one SlowDown at the moment a connection drops left
+// every one of them in the bucket permanently. Retrying is safe precisely
+// because the work is best-effort and detached — it holds up no reader and
+// blocks no Close.
+func (c *Conn) listForCleanup(ctx context.Context) ([]storage.FileInfo, error) {
+	var lastErr error
+	for attempt := 1; attempt <= cleanupListAttempts; attempt++ {
+		files, err := c.store.List(ctx, c.sessDir, "")
+		if err == nil {
+			return files, nil
+		}
+		lastErr = err
+		log.Printf("[fedarisha:%s] cleanup: listing %s failed (attempt %d/%d): %v",
+			shortID(c.sessionID), c.sessDir, attempt, cleanupListAttempts, err)
+		if attempt == cleanupListAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(cleanupRetryDelay):
+		}
+	}
+	return nil, lastErr
+}
+
 func (c *Conn) cleanupSession(ctx context.Context) {
-	files, err := c.store.List(ctx, c.sessDir, "")
+	files, err := c.listForCleanup(ctx)
 	if err != nil {
+		// Say it. A silent return here is indistinguishable from a clean
+		// teardown in the log, which is why the session's objects were never
+		// missed.
+		log.Printf("[fedarisha:%s] cleanup: giving up on %s, its objects stay in the bucket: %v",
+			shortID(c.sessionID), c.sessDir, err)
 		return
 	}
 	if len(files) == 0 {
