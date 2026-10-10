@@ -162,7 +162,7 @@ const uploadWorkers = 32
 var (
 	uploadHedgeSmall   = 600 * time.Millisecond
 	uploadHedgeLarge   = 3 * time.Second
-	uploadHedgeSizeCut = 256 * 1024 // bytes; files at/above use the large delay
+	uploadHedgeSizeCut = 256 * 1024      // bytes; files at/above use the large delay
 	uploadTimeout      = 8 * time.Second // overridden in tests
 	uploadAttempts     = 3
 
@@ -198,17 +198,21 @@ const (
 
 // holeTimeout bounds how long a missing readSeq file (with later files already
 // present) is tolerated before the session is treated as wedged and re-dialed.
-// Comfortably above a normal out-of-order gap (a slow 2MB PUT vs fast control
-// files, well under 1s) so it only fires on a genuine flow-control deadlock,
-// giving ~holeTimeout recovery instead of the keepalive's tens of seconds.
-// Set above the hedged-PUT budget (uploadHedgeDelay × a couple attempts) so a
-// merely-slow file gets overcome by a hedge before the watchdog re-dials.
 //
-// 7s was not above that budget: uploadHedgeLarge alone is 3s and uploadTimeout is
-// 8s, so under load the watchdog tore down sessions while a legitimate PUT was
-// still in flight (beta observation 2026-10-09 — the teardown, not the producer,
-// was the outage). 25s outlives the full upload budget with room to spare, and
-// still recovers in a fraction of the keepalive window.
+// KNOWN LIMITATION, unresolved. uploadBudget now scales with payload size, so
+// a large file on a slow link legitimately stays in flight far longer than
+// this: at the 128 KB/s floor a 2MB file needs ~16s and a 16MB file ~128s,
+// which is past any timeout a reader could hold. The writer is, correctly,
+// trying longer than the reader is willing to wait — and the watchdog cannot
+// tell a slow peer from a dead one, because holeSince is armed on the first
+// hole and never revisited for evidence that the peer is still producing.
+//
+// The fix is to reset the timer when the frontier advances, so the watchdog
+// measures time since the peer was last heard from rather than time since the
+// gap opened. That is not in place: it needs a spec that fails against the
+// current code, and two attempts at one passed against the very behaviour they
+// were written to catch. Shipping the change without that would trade a
+// documented limitation for an untested one.
 var holeTimeout = 25 * time.Second // overridden in tests
 
 // Hedged GETs. A healthy GET returns in a few hundred ms; a tail (a transient
@@ -615,8 +619,30 @@ func (c *Conn) uploadUntilDelivered(path string, data []byte) error {
 // fixed key+body. Small files hedge fast (a stuck control/window-update frame
 // freezes the return path); large files hedge lazily (a 2MB PUT is slow because
 // it's big, not stuck — re-uploading it would just burn uplink bandwidth).
+// minUploadRate is the slowest sustained uplink a file is still expected to go
+// out on. A budget below this does not make a slow transfer faster, it makes
+// it impossible: the attempt is killed mid-body and restarted with the same
+// budget, forever.
+const minUploadRate = 128 * 1024 // bytes per second
+
+// uploadBudget is how long one attempt may take for a payload of n bytes.
+//
+// It is uploadTimeout for anything small, and scales with the payload beyond
+// that. A flat ceiling on the whole PUT was a livelock rather than a retry:
+// the budget covered the body, not just the wait for a response, so a 2MB file
+// needed better than 256 KB/s to have any chance at all — and on a congested
+// mobile link it did not. Each attempt died mid-body, the partial upload was
+// discarded, and the retry began with the same insufficient budget.
+func uploadBudget(n int) time.Duration {
+	scaled := time.Duration(n) / minUploadRate * time.Second
+	if scaled > uploadTimeout {
+		return scaled
+	}
+	return uploadTimeout
+}
+
 func (c *Conn) uploadWithTimeout(path string, data []byte) error {
-	ctx, cancel := context.WithTimeout(c.ctx, uploadTimeout)
+	ctx, cancel := context.WithTimeout(c.ctx, uploadBudget(len(data)))
 	defer cancel()
 
 	hedgeDelay := uploadHedgeSmall
