@@ -409,10 +409,31 @@ func (c *Conn) Close() error {
 		if c.webhookHub != nil {
 			c.webhookHub.Unregister(c.sessionID)
 		}
-		c.flush()
+
+		// Shutdown signals first, flush second — never the other way round.
+		//
+		// flush() can block in sendChunks waiting for room on a full
+		// uploadQueue, and the only things that can wake it are these two
+		// signals. Publishing them afterwards meant a saturated queue parked
+		// Close() forever: closeOnce then held every other Close() caller
+		// behind it, and the cleanup goroutine below never started, so the
+		// session's objects stayed in the bucket and the outbound never
+		// re-dialed.
 		close(c.closed)
 		c.cancel()
-		close(c.uploadQueue)
+
+		// Best-effort: whatever is still buffered is dropped if the pipeline
+		// is backed up. Handing it to a wedged queue is not worth blocking
+		// teardown — the peer is already gone, and yamux is about to fail
+		// these streams anyway.
+		c.flush()
+
+		// uploadQueue is deliberately never closed. Producers can be parked
+		// inside sendChunks on a channel send at any moment, and a send on a
+		// closed channel inside a select counts as ready — so closing it
+		// races them into a panic that takes the whole process down, not just
+		// this session. The workers exit on the cancelled context instead,
+		// which cancel() above has already published.
 		c.uploadWg.Wait()
 		c.readCond.Broadcast()
 		go func() {
@@ -506,18 +527,35 @@ func (c *Conn) decrypt(data []byte, seq uint64) ([]byte, error) {
 
 // ---------- upload pipeline ----------
 
+// uploadWorker drains the queue until the connection is cancelled.
+//
+// It selects on ctx.Done rather than ranging the channel, because the channel
+// is never closed: closing it would race any sendChunks parked on a send, and
+// a send on a closed channel inside a select panics.
 func (c *Conn) uploadWorker() {
 	defer c.uploadWg.Done()
-	for job := range c.uploadQueue {
-		t0 := time.Now()
-		err := c.uploadUntilDelivered(job.path, job.data)
-		dt := time.Since(t0)
-		if err != nil {
-			c.s3PutErrors.Add(1)
-			log.Printf("[fedarisha:%s] upload ERR %s (%d B, %v): %v", shortID(c.sessionID), job.path, len(job.data), dt, err)
-		} else {
-			log.Printf("[fedarisha:%s] upload %s (%d B, %v)", shortID(c.sessionID), job.path, len(job.data), dt)
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case job, ok := <-c.uploadQueue:
+			if !ok {
+				return
+			}
+			c.runUploadJob(job)
 		}
+	}
+}
+
+func (c *Conn) runUploadJob(job uploadJob) {
+	t0 := time.Now()
+	err := c.uploadUntilDelivered(job.path, job.data)
+	dt := time.Since(t0)
+	if err != nil {
+		c.s3PutErrors.Add(1)
+		log.Printf("[fedarisha:%s] upload ERR %s (%d B, %v): %v", shortID(c.sessionID), job.path, len(job.data), dt, err)
+	} else {
+		log.Printf("[fedarisha:%s] upload %s (%d B, %v)", shortID(c.sessionID), job.path, len(job.data), dt)
 	}
 }
 
